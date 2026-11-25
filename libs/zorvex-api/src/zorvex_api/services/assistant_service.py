@@ -12,7 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import Depends, HTTPException
-from langchain_core.runnables.utils import create_model
+from langchain_core.utils.pydantic import create_model
 from langgraph.pregel import Pregel
 from sqlalchemy import ColumnElement, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert

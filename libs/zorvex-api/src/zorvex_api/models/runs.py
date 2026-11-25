@@ -25,50 +25,50 @@ from zorvex_api.models.enums import (
 
 
 class LangSmithTracer(BaseModel):
-    project_name: str | None = Field(None, description="The LangSmith project to trace the run to.")
-    example_id: str | None = Field(None, description="The dataset example the run is traced against.")
+    project_name: str | None = Field(default=None, description="The LangSmith project to trace the run to.")
+    example_id: str | None = Field(default=None, description="The dataset example the run is traced against.")
 
 
 class RunCreate(BaseModel):
     """Request model for creating runs"""
 
-    assistant_id: str = Field(..., description="Assistant to execute")
+    assistant_id: str = Field(description="Assistant to execute")
     input: Any = Field(
-        None,
+        default=None,
         description="Input to the graph, any JSON; none to continue from the thread's checkpoint or with a command.",
     )
     config: dict[str, Any] | None = Field(default_factory=dict, description="Execution config")
     context: dict[str, Any] | None = Field(default_factory=dict, description="Execution context")
     checkpoint: dict[str, Any] | None = Field(
-        None,
+        default=None,
         description="Checkpoint configuration (e.g., {'checkpoint_id': '...', 'checkpoint_ns': ''})",
     )
     checkpoint_id: UUID | None = Field(
-        None,
+        default=None,
         description="Checkpoint to run from. Short form of checkpoint={'checkpoint_id': ...}; 'checkpoint' wins if both set.",
     )
     durability: Durability | None = Field(
-        None,
+        default=None,
         description=(
             "When checkpoints are persisted: 'sync' before each next step starts, 'async' in the background "
             "while the next step runs (LangGraph default), 'exit' only once, when the run ends. "
             "Overrides the server default (checkpointer.durability)."
         ),
     )
-    stream_mode: StreamMode | list[StreamMode] | None = Field(None, description="Requested stream mode(s)")
+    stream_mode: StreamMode | list[StreamMode] | None = Field(default=None, description="Requested stream mode(s)")
     on_disconnect: DisconnectMode = Field(
-        "continue",
+        default="continue",
         description="Streaming and waiting routes: 'continue' (default) runs on when the client leaves, "
         "'cancel' cancels the run.",
     )
     on_completion: OnCompletionBehavior = Field(
-        "delete",
+        default="delete",
         description="Stateless runs only: 'delete' (default) deletes the run's thread once the run has finished, "
         "'keep' keeps it.",
     )
 
     multitask_strategy: MultitaskStrategy | None = Field(
-        None,
+        default=None,
         description=(
             "How the run meets the runs already pending or running on its thread: 'enqueue' (default) waits its "
             "turn, as a thread runs one run at a time; 'reject' answers 409; 'interrupt' interrupts them and "
@@ -76,7 +76,7 @@ class RunCreate(BaseModel):
         ),
     )
     webhook: str | None = Field(
-        None,
+        default=None,
         description=(
             "Absolute http(s) URL that receives a POST with the run, its final values and any error once the run "
             "reaches a terminal status. Must pass the server's webhooks.url policy; a URL the server will not call "
@@ -85,10 +85,10 @@ class RunCreate(BaseModel):
     )
 
     if_not_exists: IfNotExists = Field(
-        "reject", description="A missing thread: 'reject' (default) answers 404, 'create' creates it."
+        default="reject", description="A missing thread: 'reject' (default) answers 404, 'create' creates it."
     )
     after_seconds: float | None = Field(
-        None,
+        default=None,
         ge=0,
         description=(
             "Seconds from now until the run is due: its created_at. It starts no sooner, and takes its turn on "
@@ -98,45 +98,45 @@ class RunCreate(BaseModel):
 
     # Human-in-the-loop fields (core HITL functionality)
     command: dict[str, Any] | None = Field(
-        None,
+        default=None,
         description="Command for resuming interrupted runs with state updates or navigation",
     )
     interrupt_before: Literal["*"] | list[str] | None = Field(
-        None,
+        default=None,
         description="Nodes to interrupt immediately before they get executed. Use '*' for all nodes.",
     )
     interrupt_after: Literal["*"] | list[str] | None = Field(
-        None,
+        default=None,
         description="Nodes to interrupt immediately after they get executed. Use '*' for all nodes.",
     )
 
     # Subgraph configuration
-    stream_subgraphs: bool = Field(False, description="Include events from subgraphs in the stream.")
+    stream_subgraphs: bool = Field(default=False, description="Include events from subgraphs in the stream.")
     stream_resumable: bool = Field(
-        False,
+        default=False,
         description=(
             "Whether the stream can be rejoined and replayed whole after the run ends: its events are kept 10 "
             "minutes, else only while it runs and briefly after."
         ),
     )
     feedback_keys: list[str] | None = Field(
-        None,
+        default=None,
         description=(
             "LangSmith feedback keys: the run's stream ends with a feedback event of presigned URLs, one per key, "
             "and its wait or join result carries them under __feedback__. Needs LangSmith."
         ),
     )
     checkpoint_during: bool | None = Field(
-        None,
+        default=None,
         deprecated=True,
         description="Deprecated, use durability: true is 'async', false is 'exit'; durability wins when both are set.",
     )
     langsmith_tracer: LangSmithTracer | None = Field(
-        None, description="Also trace the run to this LangSmith project, when LangSmith tracing is on."
+        default=None, description="Also trace the run to this LangSmith project, when LangSmith tracing is on."
     )
 
     metadata: dict[str, Any] | None = Field(
-        None,
+        default=None,
         description="Metadata to assign to the run. Traces carry each key as langfuse.trace.metadata.<key>.",
     )
 
@@ -157,10 +157,11 @@ class RunsCancel(BaseModel):
     """Selector for ``POST /runs/cancel``: a status filter, or thread_id plus run_ids."""
 
     status: BulkCancelRunsStatus | None = Field(
-        None, description="Cancel every active run of the caller in this status. 'all' means pending and running."
+        default=None,
+        description="Cancel every active run of the caller in this status. 'all' means pending and running.",
     )
-    thread_id: str | None = Field(None, description="Thread that owns the runs listed in run_ids.")
-    run_ids: list[str] | None = Field(None, description="Runs to cancel; requires thread_id.")
+    thread_id: str | None = Field(default=None, description="Thread that owns the runs listed in run_ids.")
+    run_ids: list[str] | None = Field(default=None, description="Runs to cancel; requires thread_id.")
 
     @model_validator(mode="after")
     def validate_exactly_one_selector(self) -> Self:
@@ -182,15 +183,15 @@ class Run(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    run_id: str = Field(..., description="Unique identifier for the run.")
-    thread_id: str = Field(..., description="Thread this run belongs to.")
-    assistant_id: str = Field(..., description="Assistant that is executing this run.")
+    run_id: str = Field(description="Unique identifier for the run.")
+    thread_id: str = Field(description="Thread this run belongs to.")
+    assistant_id: str = Field(description="Assistant that is executing this run.")
     status: RunStatus = Field(
-        "pending", description="Current run status: pending, running, error, success, timeout, or interrupted."
+        default="pending", description="Current run status: pending, running, error, success, timeout, or interrupted."
     )
     metadata: dict[str, Any] = Field(default_factory=dict, description="Metadata assigned to the run at creation.")
     multitask_strategy: MultitaskStrategy | None = Field(
-        None, description="Strategy applied for concurrent runs on the same thread."
+        default=None, description="Strategy applied for concurrent runs on the same thread."
     )
     kwargs: dict[str, Any] = Field(
         default_factory=dict,
@@ -198,13 +199,15 @@ class Run(BaseModel):
         "stream and interrupt options, webhook and durability.",
     )
     created_at: datetime = Field(
-        ..., description="When the run was created; for a run with after_seconds, when it is due to start."
+        description="When the run was created; for a run with after_seconds, when it is due to start."
     )
-    updated_at: datetime = Field(..., description="Timestamp when the run was last updated.")
-    cancel_reason: str | None = Field(None, description="Why the run was cancelled, if it was.")
-    priority: int = Field(0, description="Priority of the run, -5 to 5, lower first; 0 without a priority callback.")
+    updated_at: datetime = Field(description="Timestamp when the run was last updated.")
+    cancel_reason: str | None = Field(default=None, description="Why the run was cancelled, if it was.")
+    priority: int = Field(
+        default=0, description="Priority of the run, -5 to 5, lower first; 0 without a priority callback."
+    )
     langsmith_session_name: str | None = Field(
-        None, description="The LangSmith project the run is traced to, when LangSmith tracing is on."
+        default=None, description="The LangSmith project the run is traced to, when LangSmith tracing is on."
     )
 
     @model_validator(mode="before")

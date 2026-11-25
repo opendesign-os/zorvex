@@ -41,5 +41,5 @@ def serve(app: Any) -> None:
     """Make *app* the server loopback clients reach: those made already, and those made from now on."""
     configure_loopback_transports(app)
     server = ModuleType(_SERVER_MODULE)
-    server.app = app  # ty: ignore[missing-attribute]
+    vars(server)["app"] = app
     sys.modules.setdefault(_SERVER_MODULE, server)

@@ -51,16 +51,18 @@ def _thread_run_lister(thread_id: str, user: User) -> RunLister:
 
     async def list_run_ids() -> list[tuple[str, str | None, str | None]]:
         maker = get_session_maker()
+        rows: list[tuple[str, str | None, str | None]] = []
         # sse-starlette's anyio cancel punches through asyncio.shield.
         with anyio.CancelScope(shield=True):
             async with maker() as session:
-                rows = await session.execute(
+                result = await session.execute(
                     select(RunORM.run_id, RunORM.status, AssistantORM.graph_id)
                     .outerjoin(AssistantORM, RunORM.assistant_id == AssistantORM.assistant_id)
                     .where(RunORM.thread_id == thread_id, RunORM.user_id == user.identity)
                     .order_by(RunORM.created_at.asc())
                 )
-        return [(run_id, status, graph_id) for run_id, status, graph_id in rows.all()]
+                rows = [(run_id, status, graph_id) for run_id, status, graph_id in result.all()]
+        return rows
 
     return list_run_ids
 

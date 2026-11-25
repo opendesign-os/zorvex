@@ -110,10 +110,10 @@ class ThreadTTLConfig(_Strict):
     """``checkpointer.ttl``: expiry of threads created without their own ttl."""
 
     strategy: PruneStrategy = "delete"
-    default_ttl: float = Field(43200, gt=0, le=MAX_TTL_MINUTES)  # minutes; 30 days
-    sweep_interval_minutes: float = Field(5, gt=0, le=MAX_TTL_MINUTES)
+    default_ttl: float = Field(default=43200, gt=0, le=MAX_TTL_MINUTES)  # minutes; 30 days
+    sweep_interval_minutes: float = Field(default=5, gt=0, le=MAX_TTL_MINUTES)
     # 10000 matches the documented LangGraph Platform default for this block.
-    sweep_limit: int = Field(10000, gt=0)
+    sweep_limit: int = Field(default=10000, gt=0)
 
 
 class SerdeConfig(_Strict):
@@ -197,7 +197,7 @@ class WebhookUrlPolicy(_Strict):
     require_https: bool = True
     allowed_domains: list[str] = Field(default_factory=list)
     allowed_ports: list[int] = Field(default_factory=list)
-    max_url_length: int = Field(2048, gt=0)
+    max_url_length: int = Field(default=2048, gt=0)
     disable_loopback: bool = True
     # Stricter than LangGraph and upstream Zorvex (False): webhook URLs come from callers, so a target
     # on the deployment's private network is refused unless the operator opts in.

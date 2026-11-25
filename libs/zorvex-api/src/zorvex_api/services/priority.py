@@ -36,8 +36,8 @@ class _Answer(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    priority: int | None = Field(None, ge=-5, le=5)
-    fairness_group: str | None = Field(None, max_length=256)
+    priority: int | None = Field(default=None, ge=-5, le=5)
+    fairness_group: str | None = Field(default=None, max_length=256)
 
 
 @cache

@@ -19,10 +19,10 @@ class ThreadTTLSpec(BaseModel):
     """Per-thread TTL, as the LangGraph SDK sends it: ``{"ttl": minutes, "strategy": ...}``."""
 
     ttl: float | None = Field(
-        None, gt=0, le=MAX_TTL_MINUTES, description="Thread TTL in minutes; the server default when omitted"
+        default=None, gt=0, le=MAX_TTL_MINUTES, description="Thread TTL in minutes; the server default when omitted"
     )
     strategy: PruneStrategy | None = Field(
-        None,
+        default=None,
         description="Expiry strategy: 'delete' removes the thread, 'keep_latest' prunes history",
     )
 
@@ -30,9 +30,9 @@ class ThreadTTLSpec(BaseModel):
 class ThreadCreate(BaseModel):
     """Request model for creating threads"""
 
-    metadata: dict[str, Any] | None = Field(None, description="Thread metadata")
+    metadata: dict[str, Any] | None = Field(default=None, description="Thread metadata")
     thread_id: str | None = Field(
-        None,
+        default=None,
         min_length=1,
         max_length=MAX_ENTITY_ID_LENGTH,
         pattern=ENTITY_ID_PATTERN,
@@ -44,14 +44,14 @@ class ThreadCreate(BaseModel):
         ),
     )
     if_exists: OnConflictBehavior = Field(
-        "raise", description="Behavior when thread exists: 'raise' (default) or 'do_nothing'"
+        default="raise", description="Behavior when thread exists: 'raise' (default) or 'do_nothing'"
     )
     ttl: ThreadTTLSpec | None = Field(
-        None,
+        default=None,
         description="Per-thread TTL; without a server-side default it must carry ttl",
     )
     supersteps: list[dict[str, Any]] | None = Field(
-        None,
+        default=None,
         description=(
             "Checkpoint history to seed the thread with. Each superstep is "
             '{"updates": [{"values": ..., "as_node": ...}]}. Requires graph_id in metadata.'
@@ -78,8 +78,8 @@ class ThreadCreate(BaseModel):
 class ThreadUpdate(BaseModel):
     """Request model for updating threads"""
 
-    metadata: dict[str, Any] | None = Field(None, description="Thread metadata to update")
-    ttl: ThreadTTLSpec | None = Field(None, description="Replace the thread's TTL")
+    metadata: dict[str, Any] | None = Field(default=None, description="Thread metadata to update")
+    ttl: ThreadTTLSpec | None = Field(default=None, description="Replace the thread's TTL")
 
 
 class ThreadPruneRequest(BaseModel):
@@ -87,7 +87,7 @@ class ThreadPruneRequest(BaseModel):
 
     thread_ids: list[str] = Field(description="Threads to prune. Ids the caller cannot see are skipped.")
     strategy: PruneStrategy = Field(
-        "delete",
+        default="delete",
         description="'delete' removes the threads entirely; 'keep_latest' keeps each thread and its latest state.",
     )
 
@@ -95,17 +95,15 @@ class ThreadPruneRequest(BaseModel):
 class ThreadPruneResponse(BaseModel):
     """Response model for POST /threads/prune"""
 
-    pruned_count: int = Field(0, description="Threads deleted or pruned by this request")
+    pruned_count: int = Field(default=0, description="Threads deleted or pruned by this request")
 
 
 class ThreadTTLInfo(BaseModel):
     """A thread's TTL, as ``GET /threads/{thread_id}?include=ttl`` reports it."""
 
-    strategy: PruneStrategy = Field(
-        ..., description="What expiry does: 'delete' the thread or keep only its latest state."
-    )
-    ttl_minutes: float = Field(..., description="The TTL in minutes.")
-    expires_at: datetime = Field(..., description="When the thread expires.")
+    strategy: PruneStrategy = Field(description="What expiry does: 'delete' the thread or keep only its latest state.")
+    ttl_minutes: float = Field(description="The TTL in minutes.")
+    expires_at: datetime = Field(description="When the thread expires.")
 
 
 def _absent(value: Any) -> bool:
@@ -120,16 +118,18 @@ class Thread(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    thread_id: str = Field(..., description="Unique identifier for the thread.")
-    status: ThreadStatus = Field("idle", description="Current thread status: idle, busy, interrupted, or error.")
+    thread_id: str = Field(description="Unique identifier for the thread.")
+    status: ThreadStatus = Field(
+        default="idle", description="Current thread status: idle, busy, interrupted, or error."
+    )
     metadata: dict[str, Any] = Field(
         default_factory=dict,
         validation_alias=AliasChoices("metadata_dict", "metadata"),
         description="Arbitrary metadata attached to the thread.",
     )
-    created_at: datetime = Field(..., description="Timestamp when the thread was created.")
-    updated_at: datetime = Field(..., description="Timestamp when the thread was last updated.")
-    state_updated_at: datetime | None = Field(None, description="Timestamp of the last state write.")
+    created_at: datetime = Field(description="Timestamp when the thread was created.")
+    updated_at: datetime = Field(description="Timestamp when the thread was last updated.")
+    state_updated_at: datetime | None = Field(default=None, description="Timestamp of the last state write.")
     config: dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -143,18 +143,20 @@ class Thread(BaseModel):
         description="The current interrupts of the thread, by the id of the task that raised them.",
     )
     run_priority: int | None = Field(
-        None, description="Priority of the thread's runs, -5 to 5, lower first; set by a priority callback, else null."
+        default=None,
+        description="Priority of the thread's runs, -5 to 5, lower first; set by a priority callback, else null.",
     )
     fairness_group: str | None = Field(
-        None, description="Group the thread's runs are scheduled fairly within; set by a priority callback, else null."
+        default=None,
+        description="Group the thread's runs are scheduled fairly within; set by a priority callback, else null.",
     )
     ttl: ThreadTTLInfo | None = Field(
-        None,
+        default=None,
         exclude_if=_absent,
         description="The thread's TTL; only present with include=ttl, on a thread that has one.",
     )
     extracted: dict[str, Any] | None = Field(
-        None, exclude_if=_absent, description="The values a search's `extract` asked for; only present then."
+        default=None, exclude_if=_absent, description="The values a search's `extract` asked for; only present then."
     )
 
 
@@ -180,26 +182,30 @@ EXTRACT_PATH = re.compile(r"(?P<root>values|metadata|config|interrupts)(?:\.[^.\
 class ThreadCountRequest(BaseModel):
     """Filters of POST /threads/count; search takes them too."""
 
-    metadata: dict[str, Any] | None = Field(None, description="Metadata filters")
+    metadata: dict[str, Any] | None = Field(default=None, description="Metadata filters")
     exclude_metadata: dict[str, Any] | list[dict[str, Any]] | None = Field(
-        None,
+        default=None,
         description="Exclude threads whose metadata contains this object, or any object in this list. Uses the "
         "same matching as `metadata`; threads missing the keys are not excluded.",
     )
     created_after: datetime | None = Field(
-        None, description="Only threads created at or after this time; without a timezone it is UTC."
+        default=None, description="Only threads created at or after this time; without a timezone it is UTC."
     )
     created_before: datetime | None = Field(
-        None, description="Only threads created before this time; without a timezone it is UTC."
+        default=None, description="Only threads created before this time; without a timezone it is UTC."
     )
     state_updated_after: datetime | None = Field(
-        None, description="Only threads whose state last changed at or after this time; without a timezone it is UTC."
+        default=None,
+        description="Only threads whose state last changed at or after this time; without a timezone it is UTC.",
     )
     state_updated_before: datetime | None = Field(
-        None, description="Only threads whose state last changed before this time; without a timezone it is UTC."
+        default=None,
+        description="Only threads whose state last changed before this time; without a timezone it is UTC.",
     )
-    values: dict[str, Any] | None = Field(None, description="Threads whose values contain these pairs.")
-    status: ThreadStatus | None = Field(None, description="Thread status filter (idle, busy, interrupted, error)")
+    values: dict[str, Any] | None = Field(default=None, description="Threads whose values contain these pairs.")
+    status: ThreadStatus | None = Field(
+        default=None, description="Thread status filter (idle, busy, interrupted, error)"
+    )
 
     @field_validator("created_after", "created_before", "state_updated_after", "state_updated_before")
     @classmethod
@@ -211,11 +217,11 @@ class ThreadCountRequest(BaseModel):
 class ThreadSearchRequest(ThreadCountRequest, SearchPage[ThreadSelectField]):
     """Request model for thread search"""
 
-    sort_by: ThreadSortBy = Field("created_at", description="Field to sort by.")
+    sort_by: ThreadSortBy = Field(default="created_at", description="Field to sort by.")
 
-    ids: list[str] | None = Field(None, description="Restrict results to these thread IDs")
+    ids: list[str] | None = Field(default=None, description="Restrict results to these thread IDs")
     extract: dict[str, str] | None = Field(
-        None,
+        default=None,
         max_length=10,
         description="Values to return in each thread's `extracted`, by alias: a path into the thread's values, "
         "metadata, config or interrupts, with .key and [index] steps, e.g. values.messages[-1]. At most 10.",
@@ -243,7 +249,7 @@ class ThreadCheckpointPostRequest(BaseModel):
     """Request model for fetching thread checkpoint"""
 
     checkpoint: ThreadCheckpoint = Field(description="Checkpoint to fetch")
-    subgraphs: bool | None = Field(False, description="Include subgraph states")
+    subgraphs: bool | None = Field(default=False, description="Include subgraph states")
 
 
 class ThreadState(BaseModel):
@@ -254,20 +260,20 @@ class ThreadState(BaseModel):
     tasks: list[dict[str, Any]] = Field(default_factory=list, description="Tasks to execute")
     interrupts: list[dict[str, Any]] = Field(default_factory=list, description="Interrupt data")
     metadata: dict[str, Any] = Field(default_factory=dict, description="Checkpoint metadata")
-    created_at: datetime | None = Field(None, description="Timestamp of state creation")
+    created_at: datetime | None = Field(default=None, description="Timestamp of state creation")
     checkpoint: ThreadCheckpoint = Field(description="Current checkpoint")
-    parent_checkpoint: ThreadCheckpoint | None = Field(None, description="Parent checkpoint")
+    parent_checkpoint: ThreadCheckpoint | None = Field(default=None, description="Parent checkpoint")
 
 
 class ThreadStateUpdate(BaseModel):
     """Request model for updating thread state"""
 
     values: dict[str, Any] | list[dict[str, Any]] | None = Field(
-        None, description="The values to update the state with"
+        default=None, description="The values to update the state with"
     )
-    checkpoint: dict[str, Any] | None = Field(None, description="The checkpoint to update the state of")
-    checkpoint_id: str | None = Field(None, description="Optional checkpoint ID to update from")
-    as_node: str | None = Field(None, description="Update the state as if this node had just executed")
+    checkpoint: dict[str, Any] | None = Field(default=None, description="The checkpoint to update the state of")
+    checkpoint_id: str | None = Field(default=None, description="Optional checkpoint ID to update from")
+    as_node: str | None = Field(default=None, description="Update the state as if this node had just executed")
 
 
 class ThreadStateUpdateResponse(BaseModel):
@@ -279,15 +285,15 @@ class ThreadStateUpdateResponse(BaseModel):
 class ThreadHistoryRequest(BaseModel):
     """Request model for thread history endpoint"""
 
-    limit: int = Field(10, ge=1, le=1000, description="Number of states to return")
+    limit: int = Field(default=10, ge=1, le=1000, description="Number of states to return")
     before: dict[str, Any] | str | None = Field(
-        None,
+        default=None,
         description="Return states before this checkpoint (checkpoint ID string, raw checkpoint dict, or RunnableConfig with 'configurable' key)",
     )
-    metadata: dict[str, Any] | None = Field(None, description="Filter by metadata")
-    checkpoint: dict[str, Any] | None = Field(None, description="Checkpoint for subgraph filtering")
+    metadata: dict[str, Any] | None = Field(default=None, description="Filter by metadata")
+    checkpoint: dict[str, Any] | None = Field(default=None, description="Checkpoint for subgraph filtering")
     select: list[str] | None = Field(
-        None,
+        default=None,
         description="Fields of each state to return: values, next, tasks, checkpoint, metadata, created_at, "
         "parent_checkpoint, interrupts, or values.<key> for one key of the values; all when omitted.",
     )

@@ -28,7 +28,7 @@ from zorvex_api.core.orm import Assistant as AssistantORM
 from zorvex_api.core.orm import AssistantVersion as AssistantVersionORM
 from zorvex_api.core.orm import Thread as ThreadORM
 from zorvex_api.core.orm import get_session_maker
-from zorvex_api.models.auth import User
+from zorvex_api.models.auth import User, as_base_user
 from zorvex_api.models.run_job import RunJob
 from zorvex_api.services.graph_factory import GraphFactory, generate_graph
 from zorvex_api.utils.headers import request_headers, with_headers
@@ -138,7 +138,8 @@ class LangGraphService:
         acting = loopback.acting_user.set(user)
         try:
             if isinstance(value, GraphFactory):
-                runtime = value.runtime(access_context, store=store, user=user, context=context)
+                sdk_user = as_base_user(user) if user is not None else None
+                runtime = value.runtime(access_context, store=store, user=sdk_user, context=context)
                 # A run keeps the headers it was created with; any other access sees the request's.
                 if access_context != "threads.create_run":
                     config = with_headers(dict(config), request_headers.get())
@@ -172,7 +173,7 @@ class LangGraphService:
             yield None
             return
         config = create_thread_config(thread.thread_id, user)
-        config["configurable"].update(configurable or {})
+        config.setdefault("configurable", {}).update(configurable or {})
         async with self.get_graph(
             graph_id, thread_graph_config(thread.config, config), access_context=access_context, user=user
         ) as graph:
@@ -267,7 +268,7 @@ def with_user(config: Mapping[str, Any], user: User | None) -> RunnableConfig:
         configurable["langgraph_auth_user"] = user
         configurable["langgraph_auth_user_id"] = user.identity
         configurable["langgraph_auth_permissions"] = list(user.permissions)
-    return {**config, "configurable": configurable}
+    return RunnableConfig(**{**config, "configurable": configurable})
 
 
 def create_thread_config(thread_id: str, user: User | None) -> RunnableConfig:
@@ -283,11 +284,8 @@ def thread_graph_config(thread_config: Mapping[str, Any] | None, config: Mapping
     configurable on top, as the Agent Server builds it.
     """
     base = thread_config or {}
-    return {
-        **base,
-        **config,
-        "configurable": {**(base.get("configurable") or {}), **(config.get("configurable") or {})},
-    }
+    configurable = {**(base.get("configurable") or {}), **(config.get("configurable") or {})}
+    return RunnableConfig(**{**base, **config, "configurable": configurable})
 
 
 def create_run_config(job: RunJob) -> RunnableConfig:

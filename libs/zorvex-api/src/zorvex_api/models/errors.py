@@ -9,8 +9,8 @@ from pydantic import BaseModel, Field
 class AgentProtocolError(BaseModel):
     """Standard Agent Protocol error response"""
 
-    error: str = Field(..., description="Error type")
-    message: str = Field(..., description="Human-readable error message")
+    error: str = Field(description="Error type")
+    message: str = Field(description="Human-readable error message")
 
 
 def _response(status: int, description: str) -> dict[int | str, dict[str, Any]]:

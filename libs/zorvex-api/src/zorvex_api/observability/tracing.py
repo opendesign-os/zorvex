@@ -44,11 +44,11 @@ from opentelemetry.context import Context
 from opentelemetry.environment_variables import OTEL_TRACES_EXPORTER
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.sdk.environment_variables import OTEL_TRACES_SAMPLER
 from opentelemetry.sdk.resources import SERVICE_NAME, SERVICE_VERSION, Resource
 from opentelemetry.sdk.trace import Span, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter, SpanExporter
 from opentelemetry.sdk.trace.id_generator import RandomIdGenerator
-from opentelemetry.sdk.trace.sampling import OTEL_TRACES_SAMPLER
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from opentelemetry.util.types import AttributeValue
 

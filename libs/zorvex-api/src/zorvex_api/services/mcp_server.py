@@ -23,8 +23,8 @@ from typing import Any
 import mcp_types
 import structlog
 from fastapi import HTTPException
+from mcp.server.context import ServerRequestContext
 from mcp.server.lowlevel import Server
-from mcp.server.lowlevel.server import ServerRequestContext
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.shared.exceptions import MCPError
 from mcp.shared.inbound import X_MCP_HEADER_KEY

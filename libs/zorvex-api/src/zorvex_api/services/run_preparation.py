@@ -22,6 +22,7 @@ from zorvex_api.core.orm import Run as RunORM
 from zorvex_api.core.orm import Thread as ThreadORM
 from zorvex_api.core.orm import get_session_maker
 from zorvex_api.models import Run, RunCreate, User
+from zorvex_api.models.auth import as_base_user
 from zorvex_api.models.enums import ACTIVE_RUN_STATUSES, Durability
 from zorvex_api.models.run_job import RunIdentity, RunJob, RunKwargs
 from zorvex_api.observability.tracing import trace_markers
@@ -415,7 +416,7 @@ async def prepare_run(
             binding = {"assistant_id": assistant.assistant_id, "graph_id": assistant.graph_id}
             assigned = await assign(
                 PriorityContext(
-                    user=user,
+                    user=as_base_user(user),
                     permissions=list(user.permissions),
                     thread_id=thread_id,
                     thread_metadata={**((thread.metadata_dict if thread else request.metadata) or {}), **binding},

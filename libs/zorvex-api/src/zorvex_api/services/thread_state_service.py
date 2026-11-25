@@ -52,7 +52,7 @@ def snapshot_to_thread_state(snapshot: StateSnapshot, thread_id: str) -> ThreadS
         tasks=[_task(task, thread_id) for task in snapshot.tasks],
         interrupts=to_jsonable(snapshot.interrupts),
         metadata=dict(snapshot.metadata or {}),
-        created_at=snapshot.created_at,
+        created_at=datetime.fromisoformat(snapshot.created_at) if snapshot.created_at else None,
         checkpoint=checkpoint(snapshot.config, thread_id),
         parent_checkpoint=checkpoint(snapshot.parent_config, thread_id) if snapshot.parent_config else None,
     )

@@ -208,7 +208,7 @@ async def _stream_graph(job: RunJob, final: _FinalState) -> None:
     """Build the run's graph and stream its events to the broker; *final* gets the state it stops at."""
     run_config = create_run_config(job)
     # The server's markers are for the server; the graph sees none of them.
-    configurable = run_config["configurable"]
+    configurable = run_config.setdefault("configurable", {})
     mirrors_context = configurable.pop(CONTEXT_PROVIDED, False)
     events_v2 = configurable.pop(EVENT_STREAMING_V2, False)
     if tracer := _replica(configurable.pop(LANGSMITH_PROJECT, None), configurable.pop(LANGSMITH_EXAMPLE_ID, None)):
@@ -229,8 +229,8 @@ async def _stream_graph(job: RunJob, final: _FinalState) -> None:
                 # What the context schema left out leaves the mirror too.
                 given = job.kwargs.context or {}
                 for key in given.keys() - context.keys():
-                    if run_config["configurable"].get(key) == given[key]:
-                        run_config["configurable"].pop(key, None)
+                    if configurable.get(key) == given[key]:
+                        configurable.pop(key, None)
             options = _options(job, context)
             if events_v2:
                 events = stream_native_v3_events(graph, execution_input, run_config, options)

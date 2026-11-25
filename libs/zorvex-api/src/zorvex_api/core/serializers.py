@@ -22,7 +22,7 @@ def to_jsonable(obj: Any) -> Any:
     if dataclasses.is_dataclass(obj):  # LangGraph Interrupt, Command, Send
         return {field.name: to_jsonable(getattr(obj, field.name)) for field in dataclasses.fields(obj)}
     if hasattr(obj, "_asdict") and callable(obj._asdict):  # NamedTuples such as PregelTask
-        return {key: to_jsonable(value) for key, value in obj._asdict().items()}
+        return to_jsonable(obj._asdict())
     if isinstance(obj, bytes):
         return b64encode(obj).decode("ascii")
     if isinstance(obj, Enum):

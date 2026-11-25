@@ -17,5 +17,5 @@ class SearchPage[Selected: str](BaseModel):
 
     limit: SearchLimit = 10
     offset: SearchOffset = 0
-    sort_order: SortOrder = Field("desc", description="Sort direction.")
-    select: list[Selected] | None = Field(None, description="Fields to return; all fields when omitted.")
+    sort_order: SortOrder = Field(default="desc", description="Sort direction.")
+    select: list[Selected] | None = Field(default=None, description="Fields to return; all fields when omitted.")

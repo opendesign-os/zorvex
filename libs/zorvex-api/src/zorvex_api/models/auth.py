@@ -1,7 +1,8 @@
 """The authenticated user."""
 
-from typing import Any
+from typing import Any, cast
 
+from langgraph_sdk.auth.types import BaseUser
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -32,3 +33,12 @@ class User(BaseModel):
 
     def __contains__(self, key: object) -> bool:
         return isinstance(key, str) and (key in type(self).model_fields or key in (self.model_extra or {}))
+
+
+def as_base_user(user: User) -> BaseUser:
+    """*user* as the SDK's ``BaseUser``, which its auth contexts and runtimes take.
+
+    A User is one, but the protocol leaves ``__contains__`` and ``__iter__`` unannotated,
+    which pyright reads as returning None, so it matches no user class there.
+    """
+    return cast(BaseUser, user)

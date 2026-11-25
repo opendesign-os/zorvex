@@ -44,7 +44,7 @@ import anyio
 import mcp_types
 import structlog
 from fastapi import HTTPException
-from mcp.server.lowlevel.server import ServerRequestContext
+from mcp.server.context import ServerRequestContext
 from mcp.shared.exceptions import MCPError
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import BaseModel, ConfigDict

@@ -24,7 +24,7 @@ from zorvex_api.core.orm import Run as RunORM
 from zorvex_api.core.orm import Thread as ThreadORM
 from zorvex_api.models import User
 from zorvex_api.models.enums import MultitaskStrategy
-from zorvex_api.models.runs import RunCreate
+from zorvex_api.models.runs import LangSmithTracer, RunCreate
 from zorvex_api.services.event_streaming.protocol import Response, build_error, build_success
 from zorvex_api.services.run_preparation import Launch, prepare_run
 
@@ -38,7 +38,7 @@ class _CommandError(Exception):
 
     def __init__(self, code: ErrorCode, message: str) -> None:
         super().__init__(message)
-        self.code = code
+        self.code: ErrorCode = code
         self.message = message
 
 
@@ -199,7 +199,7 @@ async def _run_start(
         interrupt_after=params.get("interrupt_after"),
         # An unknown strategy enqueues, as on the Agent Server.
         multitask_strategy=multitask if multitask in _MULTITASK_STRATEGIES else None,
-        langsmith_tracer=tracer if isinstance(tracer, dict) else None,
+        langsmith_tracer=LangSmithTracer.model_validate(tracer) if isinstance(tracer, dict) else None,
     )
     return build_success(
         command_id, {"run_id": await _start(session, thread_id, request, authorize)}, applied_through_seq=0

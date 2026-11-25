@@ -287,7 +287,9 @@ def content_parts(
             if isinstance(block.get("text"), str):
                 texts.append(block["text"])
         elif block.get("type") == "data":
-            metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+            metadata = block.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
             if a2ui.is_mime_type(metadata.get("mimeType")):
                 part = a2ui_context.part_for(block.get("data"), metadata, direction=direction)
                 if part is not None:

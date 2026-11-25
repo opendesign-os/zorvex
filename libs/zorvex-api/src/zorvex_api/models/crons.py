@@ -61,7 +61,7 @@ class _CronFields(BaseModel):
     stream_mode: StreamMode | list[StreamMode] | None = None
     stream_subgraphs: bool | None = None
     stream_resumable: bool | None = None
-    timezone: str | None = Field(None, max_length=_TIMEZONE_MAX_LEN)
+    timezone: str | None = Field(default=None, max_length=_TIMEZONE_MAX_LEN)
     durability: Durability | None = None
 
     _timezone = field_validator("timezone")(_check_timezone)
@@ -97,8 +97,8 @@ CRON_RUN_FIELDS: frozenset[str] = frozenset(
 
 
 class _NewCron(_CronFields):
-    assistant_id: str = Field(..., max_length=MAX_ENTITY_ID_LENGTH)
-    schedule: str = Field(..., max_length=_SCHEDULE_MAX_LEN)
+    assistant_id: str = Field(max_length=MAX_ENTITY_ID_LENGTH)
+    schedule: str = Field(max_length=_SCHEDULE_MAX_LEN)
     input: Any = None
 
     _schedule = field_validator("schedule")(_check_schedule)
@@ -108,7 +108,8 @@ class CronCreate(_NewCron):
     """A cron whose every run goes on a new thread (POST /runs/crons)."""
 
     on_run_completed: OnCompletionBehavior = Field(
-        "delete", description="What happens to a run's thread once the run completes: 'delete' (default) or 'keep'."
+        default="delete",
+        description="What happens to a run's thread once the run completes: 'delete' (default) or 'keep'.",
     )
 
 
@@ -121,7 +122,7 @@ class ThreadCronCreate(_NewCron):
 class CronUpdate(_CronFields):
     """Request body for updating an existing cron job; omitted fields keep their value."""
 
-    schedule: str | None = Field(None, max_length=_SCHEDULE_MAX_LEN)
+    schedule: str | None = Field(default=None, max_length=_SCHEDULE_MAX_LEN)
     input: Any = None
     on_run_completed: OnCompletionBehavior | None = None
 
@@ -186,7 +187,7 @@ class CronCountRequest(BaseModel):
 class CronSearchRequest(CronCountRequest, SearchPage[CronSelectField]):
     """Request body for searching cron jobs."""
 
-    sort_by: CronSortBy = Field("created_at", description="Field to sort by.")
+    sort_by: CronSortBy = Field(default="created_at", description="Field to sort by.")
 
     enabled: bool | None = None
 

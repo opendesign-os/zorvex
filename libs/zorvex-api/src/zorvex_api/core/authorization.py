@@ -29,7 +29,7 @@ from langgraph_sdk import Auth
 
 from zorvex_api.core import loopback
 from zorvex_api.core.auth import get_auth_instance, require_auth
-from zorvex_api.models.auth import User
+from zorvex_api.models.auth import User, as_base_user
 
 Resource = Literal["assistants", "threads", "crons", "store"]
 Action = Literal["create", "read", "update", "delete", "search", "create_run", "put", "get", "list_namespaces"]
@@ -66,7 +66,7 @@ class Authorization:
         if handler is None:
             return None
         ctx = Auth.types.AuthContext(
-            user=self.user, permissions=self.user.permissions, resource=self.resource, action=self.action
+            user=as_base_user(self.user), permissions=self.user.permissions, resource=self.resource, action=self.action
         )
         try:
             result = await handler(ctx=ctx, value=value)

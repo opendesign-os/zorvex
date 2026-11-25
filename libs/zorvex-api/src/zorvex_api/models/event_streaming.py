@@ -14,11 +14,11 @@ class EventStreamRequest(BaseModel):
     carries events for whatever run(s) execute on the thread.
     """
 
-    channels: list[str] = Field(..., description="Channels to subscribe to (e.g. messages, values, lifecycle).")
-    namespaces: list[list[str]] | None = Field(None, description="Subgraph namespace prefixes to include.")
-    depth: int | None = Field(None, ge=0, description="Max subgraph nesting depth to include.")
+    channels: list[str] = Field(description="Channels to subscribe to (e.g. messages, values, lifecycle).")
+    namespaces: list[list[str]] | None = Field(default=None, description="Subgraph namespace prefixes to include.")
+    depth: int | None = Field(default=None, ge=0, description="Max subgraph nesting depth to include.")
     since: int | None = Field(
-        None,
+        default=None,
         ge=0,
         description="Last seq the client saw; events at or below it are skipped on resume.",
     )
@@ -27,6 +27,6 @@ class EventStreamRequest(BaseModel):
 class ThreadCommand(BaseModel):
     """Body for ``POST /threads/{thread_id}/commands`` (JSON-RPC style)."""
 
-    id: int = Field(..., description="Client-assigned command id, echoed in the response.")
-    method: str = Field(..., description="Command method, e.g. run.start or input.respond.")
+    id: int = Field(description="Client-assigned command id, echoed in the response.")
+    method: str = Field(description="Command method, e.g. run.start or input.respond.")
     params: dict[str, Any] = Field(default_factory=dict, description="Method parameters.")

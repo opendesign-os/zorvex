@@ -33,7 +33,7 @@ async def stream_graph_events(
     ``events`` adds astream_events' events. A subgraph's events carry
     ``|namespace`` after their mode. *options* go to astream as they are.
     """
-    run_id = str(config["configurable"]["run_id"])
+    run_id = str(config.get("configurable", {})["run_id"])
     requested = set(stream_mode)
     modes = requested - {"events", "messages-tuple"}
     if "messages-tuple" in requested:

@@ -107,7 +107,9 @@ class _Socket:
         method = body.get("method") if isinstance(body, dict) else None
         if not isinstance(command_id, int) or isinstance(command_id, bool) or not isinstance(method, str):
             return build_error(None, "invalid_argument", INVALID_COMMAND), None
-        params = body.get("params") if isinstance(body.get("params"), dict) else {}
+        params = body.get("params")
+        if not isinstance(params, dict):
+            params = {}
         if method in (_SUBSCRIBE, _RECONNECT):
             return self.subscribe(command_id, params, method), method
         if method == _UNSUBSCRIBE:
