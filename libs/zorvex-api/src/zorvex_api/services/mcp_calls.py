@@ -58,7 +58,6 @@ from zorvex_api.models import ThreadCreate, ThreadTTLSpec, ThreadUpdate, User
 from zorvex_api.models.runs import RunCreate
 from zorvex_api.services.mcp_elicitation import EndCall, Mode, Refusal, Round, UnaskableInterrupt, digest
 from zorvex_api.services.ownership import authorized_run, authorized_thread
-from zorvex_api.services.run_cleanup import delete_thread_after_run
 from zorvex_api.services.run_preparation import Launch, create_run
 from zorvex_api.services.run_waiters import (
     Completed,
@@ -157,11 +156,8 @@ async def run_stateless(user: User, assistant_id: str, params: CallToolParams) -
     """Run the assistant on a throwaway thread and answer what it came to, as ``POST /runs/wait`` does."""
     request = RunCreate(assistant_id=assistant_id, input=params.input, context=params.context)
     run = await create_run(Authorization(user, "threads", "create_run"), None, request)
-    try:
-        return _step(run_outcome(await wait_for_result(run.run_id, run.thread_id, user)))
-    finally:
-        # The result is read from the thread, so the thread goes only after it.
-        delete_thread_after_run(run, user.identity)
+    # The result comes from the run's events: its temporary thread goes when the run ends.
+    return _step(run_outcome(await wait_for_result(run.run_id, run.thread_id, user)))
 
 
 # --- a call's state across rounds

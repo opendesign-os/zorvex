@@ -1,7 +1,8 @@
 """Background task that recovers runs with expired worker leases.
 
 Periodically scans the runs table for rows where
-``status='running' AND lease_expires_at < now()``. It atomically either
+``status='running' AND lease_expires_at < now()``, ``now()`` being the
+database's clock, which every instance shares. It atomically either
 returns them to ``pending`` or marks their retry budget exhausted, then
 re-enqueues only retryable run IDs.
 """
@@ -21,7 +22,8 @@ from zorvex_api.services.broker import broker_manager
 from zorvex_api.services.executor import executor
 from zorvex_api.services.periodic import PeriodicTask
 from zorvex_api.services.run_queue import runnable
-from zorvex_api.services.run_status import settle_threads
+from zorvex_api.services.run_status import lease_expired, settle_threads
+from zorvex_api.services.thread_deletion import delete_temporary_thread
 from zorvex_api.services.webhook_delivery import RunOutcome, job_for_webhook, report_run
 from zorvex_api.settings import settings
 
@@ -79,19 +81,15 @@ class LeaseReaper(PeriodicTask):
         Returns (crashed_run_ids, stuck_pending_run_ids) separately so retry
         budget is only charged to crashed runs, not stuck pending ones.
         """
-        now = datetime.now(UTC)
         maker = get_session_maker()
         async with maker() as session:
             crashed_result = await session.execute(
-                select(RunORM.run_id).where(
-                    RunORM.status == "running",
-                    RunORM.lease_expires_at.isnot(None),
-                    RunORM.lease_expires_at < now,
-                )
+                select(RunORM.run_id).where(RunORM.status == "running", lease_expired())
             )
             crashed = [row[0] for row in crashed_result.fetchall()]
 
             # Only runs whose turn has come: one waiting behind another on its thread is not stuck.
+            now = datetime.now(UTC)
             stuck_result = await session.execute(
                 select(RunORM.run_id).where(
                     RunORM.claimed_by.is_(None),
@@ -115,6 +113,8 @@ class LeaseReaper(PeriodicTask):
         exhausted: list[str] = []
         exhausted_threads_by_user: dict[str, set[str]] = {}
         failed_jobs: list[RunJob] = []
+        # The exhausted runs, whose temporary threads go once their failure is committed.
+        ended_jobs: list[RunJob] = []
 
         maker = get_session_maker()
         async with maker() as session:
@@ -131,7 +131,7 @@ class LeaseReaper(PeriodicTask):
                 .where(
                     RunORM.run_id.in_(run_ids),
                     RunORM.status == "running",
-                    RunORM.lease_expires_at < now,
+                    lease_expired(),
                 )
                 .with_for_update(skip_locked=True)
             )
@@ -161,7 +161,7 @@ class LeaseReaper(PeriodicTask):
                         RunORM.run_id == run_id,
                         RunORM.user_id == user_id,
                         RunORM.status == "running",
-                        RunORM.lease_expires_at < now,
+                        lease_expired(),
                     )
                     .values(**values)
                     .returning(RunORM.run_id)
@@ -172,6 +172,11 @@ class LeaseReaper(PeriodicTask):
                 if is_exhausted:
                     exhausted.append(run_id)
                     exhausted_threads_by_user.setdefault(user_id, set()).add(thread_id)
+                    ended_jobs.append(
+                        RunJob.from_execution_params(
+                            params, run_id=run_id, thread_id=thread_id, assistant_id=assistant_id, created_at=created_at
+                        )
+                    )
                     failed_job = job_for_webhook(
                         params, run_id=run_id, thread_id=thread_id, assistant_id=assistant_id, created_at=created_at
                     )
@@ -204,6 +209,8 @@ class LeaseReaper(PeriodicTask):
             for job in failed_jobs:
                 outcome = RunOutcome(status="error", error=_MAX_RETRIES_ERROR)
                 report_run(job, outcome, run_id=job.identity.run_id)
+        for job in ended_jobs:
+            await delete_temporary_thread(job)
 
         freed = {thread_id for thread_ids in exhausted_threads_by_user.values() for thread_id in thread_ids}
         return retryable, exhausted, freed

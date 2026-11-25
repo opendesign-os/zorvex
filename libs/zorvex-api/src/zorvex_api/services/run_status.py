@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import structlog
-from sqlalchemy import ColumnElement, CursorResult, exists, or_, select, update
+from sqlalchemy import ColumnElement, CursorResult, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from zorvex_api.core.orm import Run as RunORM
@@ -82,9 +82,18 @@ async def settle_threads(
     )
 
 
-def unowned(now: datetime) -> ColumnElement[bool]:
-    """A run no live worker holds: never claimed, or its lease run out before *now*."""
-    return or_(RunORM.claimed_by.is_(None), RunORM.lease_expires_at < now)
+def lease_expired() -> ColumnElement[bool]:
+    """A run whose worker's lease has run out.
+
+    Leases are taken, renewed and judged by the database's clock, the one clock every
+    instance shares: skew between instances cannot end a live worker's lease early.
+    """
+    return RunORM.lease_expires_at < func.now()
+
+
+def unowned() -> ColumnElement[bool]:
+    """A run no live worker holds: never claimed, or its lease has run out."""
+    return or_(RunORM.claimed_by.is_(None), lease_expired())
 
 
 async def interrupt_unowned_run(
@@ -112,7 +121,7 @@ async def interrupt_unowned_run(
                 RunORM.thread_id == thread_id,
                 RunORM.user_id == user_id,
                 RunORM.status.in_(ACTIVE_RUN_STATUSES),
-                unowned(now),
+                unowned(),
             )
             .values(
                 status="interrupted",

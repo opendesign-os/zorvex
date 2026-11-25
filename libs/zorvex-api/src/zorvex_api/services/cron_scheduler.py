@@ -2,8 +2,9 @@
 
 A claim holds a cron for CRON_CLAIM_DURATION_SECONDS (``claimed_until``), so
 instances polling together fire it once and a slow firing does not race the
-next tick. Firing is at least once: an instance that dies between starting the
-run and moving the cron on leaves the claim to expire, and the cron fires again.
+next tick. Claims are taken and judged by the database's clock, which every
+instance shares. Firing is at least once: an instance that dies between starting
+the run and moving the cron on leaves the claim to expire, and the cron fires again.
 """
 
 import contextlib
@@ -11,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 from fastapi import HTTPException
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from zorvex_api.core.orm import Cron as CronORM
@@ -19,7 +20,6 @@ from zorvex_api.core.orm import get_session_maker
 from zorvex_api.models import Run, RunCreate, User
 from zorvex_api.services.cron_service import next_run_date
 from zorvex_api.services.periodic import PeriodicTask
-from zorvex_api.services.run_cleanup import delete_thread_after_run
 from zorvex_api.services.run_preparation import Launch, prepare_run, prepare_stateless_run
 from zorvex_api.settings import settings
 
@@ -40,10 +40,7 @@ async def start_cron_run(session: AsyncSession, cron: CronORM, user: User) -> Ru
             session, cron.thread_id, RunCreate.model_validate(fields), user, authorize=None, launch=launch
         )
     request = RunCreate.model_validate({**fields, "on_completion": cron.on_run_completed or "delete"})
-    run = await prepare_stateless_run(session, request, user, authorize=None, launch=launch)
-    if request.on_completion != "keep":
-        delete_thread_after_run(run, user.identity)
-    return run
+    return await prepare_stateless_run(session, request, user, authorize=None, launch=launch)
 
 
 async def _claim_due(now: datetime) -> list[CronORM]:
@@ -59,7 +56,7 @@ async def _claim_due(now: datetime) -> list[CronORM]:
             .where(
                 CronORM.enabled.is_(True),
                 CronORM.next_run_date <= now,
-                CronORM.claimed_until.is_(None) | (CronORM.claimed_until <= now),
+                CronORM.claimed_until.is_(None) | (CronORM.claimed_until <= func.now()),
             )
             .order_by(CronORM.next_run_date.asc())
             .limit(batch if batch > 0 else None)
@@ -72,7 +69,7 @@ async def _claim_due(now: datetime) -> list[CronORM]:
                 await session.scalars(
                     update(CronORM)
                     .where(CronORM.cron_id.in_(cron_ids))
-                    .values(claimed_until=now + timedelta(seconds=settings.cron.CRON_CLAIM_DURATION_SECONDS))
+                    .values(claimed_until=func.now() + timedelta(seconds=settings.cron.CRON_CLAIM_DURATION_SECONDS))
                     .returning(CronORM)
                 )
             )

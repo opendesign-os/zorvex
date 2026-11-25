@@ -22,12 +22,9 @@ from zorvex_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
 from zorvex_api.models.runs import RUN_EXECUTION_PARAMS_FIELDS, RunSelectField, run_fields_from_execution_params
 from zorvex_api.services import checkpoints, run_waiters, streaming_service
 from zorvex_api.services.ownership import on_visible_threads, owned_run, owned_thread
-from zorvex_api.services.run_cleanup import (
-    cancel_on_disconnect,
-    request_run_interruption,
-    stop_run_for_delete,
-)
+from zorvex_api.services.run_cleanup import cancel_on_disconnect, request_run_interruption
 from zorvex_api.services.run_preparation import prepare_run
+from zorvex_api.services.thread_deletion import stop_run_for_delete
 from zorvex_api.settings import settings
 
 CloseHandler = Callable[[MutableMapping[str, Any]], Awaitable[None]]

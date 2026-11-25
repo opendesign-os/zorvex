@@ -5,6 +5,9 @@ hosts, sslmode, sslrootcert, target_session_attrs and the PG* environment variab
 work as in libpq. Prepared statements are off, so PgBouncer in transaction mode works.
 """
 
+import asyncio
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import cast
 
 import structlog
@@ -31,6 +34,33 @@ _STORE_TTL_DEFAULTS: TTLConfig = {"refresh_on_read": True, "omit_expired": True,
 
 async def _connect() -> AsyncConnection:
     return await AsyncConnection.connect(settings.db.DATABASE_URI, prepare_threshold=None)
+
+
+_TRY_SCHEMA_LOCK = "SELECT pg_try_advisory_xact_lock(hashtextextended('zorvex:' || coalesce(current_schema(), ''), 0))"
+_SCHEMA_LOCK_POLL_SECONDS = 0.5
+
+
+@asynccontextmanager
+async def schema_lock() -> AsyncGenerator[None]:
+    """Hold the schema's setup lock: instances starting together migrate and create LangGraph's tables in turn.
+
+    Without it, instances starting on a new database create the same tables at once, and all but one fail.
+    The advisory lock belongs to the connection's open transaction, so PgBouncer in transaction mode keeps
+    it, and is keyed on the schema the search_path selects, so servers on other schemas do not wait.
+    A waiter polls rather than blocks: a blocked statement holds a snapshot, which LangGraph's
+    CREATE INDEX CONCURRENTLY, run by the lock's holder, would wait on for good.
+    """
+    async with await _connect() as conn:
+        while not await _try_schema_lock(conn):
+            await conn.rollback()
+            await asyncio.sleep(_SCHEMA_LOCK_POLL_SECONDS)
+        yield
+    # Leaving the connection ends its transaction, and the lock with it.
+
+
+async def _try_schema_lock(conn: AsyncConnection) -> bool:
+    row = await (await conn.execute(_TRY_SCHEMA_LOCK)).fetchone()
+    return bool(row and row[0])
 
 
 class DatabaseManager:

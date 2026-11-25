@@ -19,7 +19,7 @@ from typing import cast
 
 import structlog
 from redis import RedisError
-from sqlalchemy import select, update
+from sqlalchemy import ColumnElement, func, select, update
 
 from zorvex_api.core.active_runs import active_runs, explicit_run_cancellations
 from zorvex_api.core.orm import Run as RunORM
@@ -28,6 +28,7 @@ from zorvex_api.core.redis_manager import redis_manager
 from zorvex_api.models.enums import TERMINAL_RUN_STATUSES
 from zorvex_api.models.run_job import RunJob
 from zorvex_api.services import job_queue
+from zorvex_api.services.base_broker import cancelled_error
 from zorvex_api.services.base_executor import BaseExecutor
 from zorvex_api.services.broker import broker_manager
 from zorvex_api.services.redis_broker import RedisBrokerManager
@@ -424,18 +425,21 @@ async def _get_run_identity(run_id: str) -> tuple[str, str] | None:
 # ------------------------------------------------------------------
 
 
+def _lease_end() -> ColumnElement[datetime]:
+    """When a lease taken or renewed now runs out, by the database's clock (``run_status.lease_expired``)."""
+    return func.now() + timedelta(seconds=settings.worker.LEASE_DURATION_SECONDS)
+
+
 async def _acquire_and_load(run_id: str, worker_name: str) -> RunJob | None:
     """Claim the run's lease and read its job, in one statement: the UPDATE returns the claimed row."""
-    now = datetime.now(UTC)
-    lease_until = now + timedelta(seconds=settings.worker.LEASE_DURATION_SECONDS)
     maker = get_session_maker()
     async with maker() as session:
         # With its thread locked, the check that no other run on it runs holds until this claim commits.
         await lock_line(session, run_id)
         run_orm = await session.scalar(
             update(RunORM)
-            .where(RunORM.run_id == run_id, RunORM.claimed_by.is_(None), runnable(now))
-            .values(claimed_by=worker_name, lease_expires_at=lease_until, status="running")
+            .where(RunORM.run_id == run_id, RunORM.claimed_by.is_(None), runnable(datetime.now(UTC)))
+            .values(claimed_by=worker_name, lease_expires_at=_lease_end(), status="running")
             .returning(RunORM)
         )
         if run_orm is None:
@@ -513,22 +517,26 @@ async def _release_lease(run_id: str, worker_name: str) -> None:
 
 
 async def _heartbeat_loop(run_id: str, worker_name: str, job_task: asyncio.Task[None]) -> None:
-    """Extend the lease while the job runs; a lease another worker took cancels *job_task*, so it runs once."""
+    """Extend the lease while the job runs; a lease another worker took cancels *job_task*, so it runs once.
+
+    Each renewal also reads back the cancel recorded on the run: one whose pub/sub message never reached
+    this instance (a dropped subscription) stops the run here all the same, a heartbeat later.
+    """
     interval = settings.worker.heartbeat_interval_seconds
-    duration = settings.worker.LEASE_DURATION_SECONDS
     maker = get_session_maker()
 
     while True:
         await asyncio.sleep(interval)
         try:
-            new_expiry = datetime.now(UTC) + timedelta(seconds=duration)
             async with maker() as session:
-                renewed = await session.scalar(
-                    update(RunORM)
-                    .where(RunORM.run_id == run_id, RunORM.claimed_by == worker_name)
-                    .values(lease_expires_at=new_expiry)
-                    .returning(RunORM.run_id)
-                )
+                renewed = (
+                    await session.execute(
+                        update(RunORM)
+                        .where(RunORM.run_id == run_id, RunORM.claimed_by == worker_name)
+                        .values(lease_expires_at=_lease_end())
+                        .returning(RunORM.cancel_action, RunORM.cancel_reason)
+                    )
+                ).one_or_none()
                 await session.commit()
             if renewed is None:
                 logger.warning(
@@ -540,6 +548,10 @@ async def _heartbeat_loop(run_id: str, worker_name: str, job_task: asyncio.Task[
                     _lease_loss_cancellations.add(run_id)
                     job_task.cancel()
                 return
+            action, reason = renewed
+            if action is not None and run_id not in explicit_run_cancellations:
+                logger.warning("The run was cancelled but no cancel message came; cancelling it", run_id=run_id)
+                cast(RedisBrokerManager, broker_manager).cancel_here(run_id, cancelled_error(action, reason))
             logger.debug("Lease extended", run_id=run_id, worker=worker_name)
         except Exception:
             logger.warning("Heartbeat lease extension failed", run_id=run_id, worker=worker_name)

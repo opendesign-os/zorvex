@@ -20,6 +20,7 @@ from langgraph.graph import StateGraph
 from langgraph.pregel import Pregel
 from langgraph_sdk.runtime import AccessContext
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from zorvex_api.config import GraphEntry, load_config
 from zorvex_api.core import loopback
@@ -195,8 +196,10 @@ class LangGraphService:
                     select(AssistantORM).where(AssistantORM.assistant_id == assistant_id).with_for_update()
                 )
                 if assistant is None:
-                    session.add(
-                        AssistantORM(
+                    # Instances starting together all get here; the insert lets one of them create it.
+                    created = await session.scalar(
+                        pg_insert(AssistantORM)
+                        .values(
                             assistant_id=assistant_id,
                             name=name,
                             description=description,
@@ -205,18 +208,21 @@ class LangGraphService:
                             user_id=SYSTEM_OWNER,
                             metadata_dict={"created_by": SYSTEM_OWNER},
                         )
+                        .on_conflict_do_nothing(index_elements=[AssistantORM.assistant_id])
+                        .returning(AssistantORM.assistant_id)
                     )
-                    session.add(
-                        AssistantVersionORM(
-                            assistant_id=assistant_id,
-                            version=1,
-                            name=name,
-                            description=description,
-                            graph_id=graph_id,
-                            config={},
-                            metadata_dict={"created_by": SYSTEM_OWNER},
+                    if created is not None:
+                        session.add(
+                            AssistantVersionORM(
+                                assistant_id=assistant_id,
+                                version=1,
+                                name=name,
+                                description=description,
+                                graph_id=graph_id,
+                                config={},
+                                metadata_dict={"created_by": SYSTEM_OWNER},
+                            )
                         )
-                    )
                     continue
                 if assistant.user_id != SYSTEM_OWNER or (assistant.name, assistant.description) == (name, description):
                     continue

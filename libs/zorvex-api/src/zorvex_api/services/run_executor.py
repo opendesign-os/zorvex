@@ -31,6 +31,7 @@ from zorvex_api.services.langgraph_service import create_run_config, create_thre
 from zorvex_api.services.run_cancel import end_cancelled_run
 from zorvex_api.services.run_status import Ending, finalize_run, start_run
 from zorvex_api.services.streaming_service import error_event
+from zorvex_api.services.thread_deletion import delete_temporary_thread
 from zorvex_api.services.thread_state_service import snapshot_values
 from zorvex_api.services.webhook_delivery import finish_executing
 from zorvex_api.utils.run_utils import (
@@ -76,6 +77,8 @@ async def _execute(job: RunJob) -> None:
     user_id = job.user.identity
     resumes_elsewhere = False
     finalized = False
+    # The run reached its end here: finalized by this execution, or found ended by another actor.
+    ended = False
     final = _FinalState()
     started_at: datetime | None = None
     executing_runs.add(run_id)
@@ -84,11 +87,13 @@ async def _execute(job: RunJob) -> None:
         # A run with after_seconds is not handed over before it is due (created_at): see run_queue.
         if not await start_run(run_id, user_id=user_id):
             logger.info("Run became terminal before execution started", run_id=run_id)
+            ended = True
             return
         started_at = datetime.now(UTC)
 
         await _stream_graph(job, final)
         finalized = await finalize_run(run_id, thread_id, final.ending("success"), user_id=user_id, webhook_job=job)
+        ended = True
 
     except asyncio.CancelledError:
         if run_id in _lease_loss_cancellations:
@@ -104,6 +109,7 @@ async def _execute(job: RunJob) -> None:
             finalized = await finalize_run(
                 run_id, thread_id, final.ending("timeout", error), user_id=user_id, webhook_job=job
             )
+            ended = True
             if finalized:
                 await _best_effort_signal(streaming_service.end_run, run_id, "timeout", error)
         else:
@@ -111,6 +117,7 @@ async def _execute(job: RunJob) -> None:
             finalized, error = await end_cancelled_run(
                 run_id, thread_id, final.ending("interrupted"), user_id=user_id, webhook_job=job
             )
+            ended = True
             if finalized:
                 await _best_effort_signal(streaming_service.end_run, run_id, "interrupted", error or cancelled_error())
         raise
@@ -120,6 +127,7 @@ async def _execute(job: RunJob) -> None:
         finalized = await finalize_run(
             run_id, thread_id, final.ending("error", error), user_id=user_id, webhook_job=job
         )
+        ended = True
         if finalized:
             await _best_effort_signal(streaming_service.end_run, run_id, "error", error)
     else:
@@ -134,6 +142,9 @@ async def _execute(job: RunJob) -> None:
         if not resumes_elsewhere:
             await streaming_service.cleanup_run(run_id, resumable=job.kwargs.resumable)
             await _signal_run_done(run_id)
+        if ended:
+            # A wait reads the result from the run's events, kept after its end, not from the thread.
+            await delete_temporary_thread(job)
 
 
 # ------------------------------------------------------------------

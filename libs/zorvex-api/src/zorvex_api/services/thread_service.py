@@ -20,7 +20,7 @@ from zorvex_api.core.orm import ThreadTTL as ThreadTTLORM
 from zorvex_api.models import ThreadCreate, ThreadTTLSpec, ThreadUpdate, User
 from zorvex_api.services.langgraph_service import create_thread_config, get_langgraph_service
 from zorvex_api.services.ownership import owned_thread, visible_threads
-from zorvex_api.services.run_cleanup import delete_threads
+from zorvex_api.services.thread_deletion import delete_threads
 from zorvex_api.services.thread_state_service import snapshot_values
 from zorvex_api.services.thread_ttl import get_thread_ttl_config
 from zorvex_api.utils.jsonb import jsonb_patch, jsonb_shallow_merge

@@ -30,7 +30,8 @@ from zorvex_api.services.executor import executor
 from zorvex_api.services.langgraph_service import get_langgraph_service
 from zorvex_api.services.ownership import existing_thread, owned_assistant
 from zorvex_api.services.priority import ThreadPriority, assign, callback
-from zorvex_api.services.run_cleanup import delete_thread_by_id, request_run_interruption
+from zorvex_api.services.run_cleanup import request_run_interruption
+from zorvex_api.services.thread_deletion import delete_thread_by_id
 from zorvex_api.services.webhook_policy import admit_webhook
 from zorvex_api.utils.headers import request_headers
 from zorvex_api.utils.jsonb import jsonb_patch, jsonb_shallow_merge

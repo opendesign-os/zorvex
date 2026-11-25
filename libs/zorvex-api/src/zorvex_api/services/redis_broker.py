@@ -263,6 +263,8 @@ class RedisBrokerManager(BaseBrokerManager):
         # Waiters in this process, by run: set when the run's done message arrives.
         self._done_watchers: dict[str, set[asyncio.Event]] = {}
         self._listener_task: asyncio.Task[None] | None = None
+        # Strong refs to the cancels cancel_here started, until they are done.
+        self._cancels: set[asyncio.Task[None]] = set()
         self._running: bool = False
 
     def _make_broker(self, run_id: str) -> RedisRunBroker:
@@ -327,6 +329,16 @@ class RedisBrokerManager(BaseBrokerManager):
             # Fall back to local execution - if the task is on this instance,
             # we can still cancel it even if Redis publish fails.
             await self._execute_cancel(run_id, end_error)
+
+    def cancel_here(self, run_id: str, end_error: dict[str, str] | None) -> None:
+        """Stop a run this instance executes as its cancel message would have, in a task of its own.
+
+        For a cancel recorded on the run whose message never arrived; the caller, such as the run's
+        heartbeat, may go down with the run before the cancel has ended its stream.
+        """
+        task = asyncio.create_task(self._execute_cancel(run_id, end_error))
+        self._cancels.add(task)
+        task.add_done_callback(self._cancels.discard)
 
     def done_key(self, run_id: str) -> str:
         """The key a done run leaves, for the waiters that start after its message."""

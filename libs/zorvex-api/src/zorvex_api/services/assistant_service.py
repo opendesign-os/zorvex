@@ -29,7 +29,7 @@ from zorvex_api.models import Assistant, AssistantCountRequest, AssistantCreate,
 from zorvex_api.models.assistants import AssistantVersionsRequest
 from zorvex_api.models.auth import User
 from zorvex_api.models.enums import OnConflictBehavior
-from zorvex_api.services import run_cleanup
+from zorvex_api.services import thread_deletion
 from zorvex_api.services.langgraph_service import LangGraphService, get_langgraph_service
 from zorvex_api.services.ownership import owned_assistant, readable_assistants
 
@@ -264,7 +264,7 @@ class AssistantService:
                     ThreadORM.metadata_dict.op("@>")({"assistant_id": assistant_id}),
                 )
             )
-            result["deleted_threads"] = await run_cleanup.delete_threads(
+            result["deleted_threads"] = await thread_deletion.delete_threads(
                 self.session, thread_ids.all(), user_id=self.user.identity
             )
         await self.session.delete(assistant)

@@ -108,9 +108,10 @@ async def _stored_result(run_id: str, thread_id: str, user: User, *, timed_out: 
                 RunORM.run_id == run_id, RunORM.thread_id == thread_id, RunORM.user_id == user.identity
             )
         )
-        thread = await session.get(ThreadORM, thread_id) if run is not None and run.status == "success" else None
+        thread = await session.get(ThreadORM, thread_id) if run is None or run.status == "success" else None
     if run is None:
-        return error_envelope("RunNotFound", f"Run '{run_id}' no longer exists")
+        # Gone with its thread, as a stateless run's goes once the run ends: nothing to read, as on the Agent Server.
+        return {} if thread is None else error_envelope("RunNotFound", f"Run '{run_id}' no longer exists")
     if run.status in ACTIVE_RUN_STATUSES:
         if timed_out:
             return error_envelope("TimeoutError", f"Run '{run_id}' did not finish within the wait timeout")

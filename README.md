@@ -121,9 +121,10 @@ Every setting, with its default and meaning, is in
 - **Authentication**: without `auth.path`, every request is one anonymous user. Set it up before the server is
   reachable by others.
 - **Several instances**: point them at one PostgreSQL and one Redis (`REDIS_URI`). Runs are queued to workers with
-  leases, so the runs of an instance that dies are picked up by the others, and streams work from any instance.
-- **Migrations**: the server applies them as it starts. With several replicas you can set
-  `RUN_MIGRATIONS_ON_STARTUP=false` and run `zorvex db upgrade` once per release instead.
+  leases on the database's clock, so the runs of an instance that dies are picked up by the others, and streams
+  work from any instance.
+- **Migrations**: the server applies them as it starts; instances starting together take turns. With many replicas
+  you can set `RUN_MIGRATIONS_ON_STARTUP=false` and run `zorvex db upgrade` once per release instead.
 - **Probes**: `/ok` for liveness (`/ok?check_db=1` also checks PostgreSQL), `/info` for the version and features,
   `/metrics` for Prometheus.
 

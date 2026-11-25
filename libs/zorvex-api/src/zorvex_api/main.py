@@ -39,7 +39,7 @@ from zorvex_api.config import CorsConfig, HttpConfig, load_config, mount_prefix
 from zorvex_api.core import loopback
 from zorvex_api.core.auth import get_auth_backend, require_auth
 from zorvex_api.core.authorization import check_authorization
-from zorvex_api.core.database import db_manager
+from zorvex_api.core.database import db_manager, schema_lock
 from zorvex_api.core.migrations import run_migrations_async
 from zorvex_api.core.redis_manager import redis_manager
 from zorvex_api.core.route_merger import (
@@ -110,20 +110,16 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     get_auth_backend()
     priority.callback()
 
-    # Multi-pod K8s: set RUN_MIGRATIONS_ON_STARTUP=false and run `zorvex db upgrade` out-of-band,
-    # so replicas do not race each other through the migrations.
-    if settings.app.RUN_MIGRATIONS_ON_STARTUP:
-        try:
-            await run_migrations_async()
-        except (ConnectionRefusedError, OSError) as e:
-            _log_connection_help(e)
-            raise
-    else:
-        logger.info("skipping startup migrations (RUN_MIGRATIONS_ON_STARTUP=false)")
-
-    # Startup: Initialize database and LangGraph components
+    # Instances starting together set the schema up in turn: the first migrates and creates LangGraph's
+    # tables, the others find them there. With many replicas, RUN_MIGRATIONS_ON_STARTUP=false and
+    # `zorvex db upgrade` once per release keep a long migration from holding the others past their probes.
     try:
-        await db_manager.initialize()
+        async with schema_lock():
+            if settings.app.RUN_MIGRATIONS_ON_STARTUP:
+                await run_migrations_async()
+            else:
+                logger.info("skipping startup migrations (RUN_MIGRATIONS_ON_STARTUP=false)")
+            await db_manager.initialize()
     except (ConnectionRefusedError, OSError) as e:
         _log_connection_help(e)
         raise

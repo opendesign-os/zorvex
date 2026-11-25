@@ -3517,7 +3517,7 @@
           "Stateless Runs"
         ],
         "summary": "Stateless Wait For Run",
-        "description": "Create a stateless run and wait for its output.\n\nResponds as `POST /threads/{thread_id}/runs/wait` does. The run's thread\nis deleted after the output has been sent, unless `on_completion` is `\"keep\"`.",
+        "description": "Create a stateless run and wait for its output.\n\nResponds as `POST /threads/{thread_id}/runs/wait` does, the output read from the run's events.\nThe run's thread is deleted once the run has finished, unless `on_completion` is `\"keep\"`.",
         "operationId": "stateless_wait_for_run_runs_wait_post",
         "requestBody": {
           "content": {
