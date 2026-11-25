@@ -2940,7 +2940,7 @@ wheels = [
 
 [[package]]
 name = "zorvex-api"
-version = "0.0.2"
+version = "0.0.3"
 source = { editable = "libs/zorvex-api" }
 dependencies = [
     { name = "alembic" },
@@ -3013,7 +3013,7 @@ requires-dist = [
 
 [[package]]
 name = "zorvex-cli"
-version = "0.0.2"
+version = "0.0.3"
 source = { editable = "libs/zorvex-cli" }
 dependencies = [
     { name = "click" },

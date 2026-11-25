@@ -3,7 +3,7 @@
   "info": {
     "title": "Zorvex",
     "description": "The LangGraph Agent Server API, self-hosted",
-    "version": "0.0.2"
+    "version": "0.0.3"
   },
   "paths": {
     "/ok": {
