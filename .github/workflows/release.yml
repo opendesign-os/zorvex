@@ -1,12 +1,18 @@
 name: Release
 
-# A tag vX.Y.Z publishes zorvex-api and zorvex-cli at X.Y.Z to PyPI, then makes
-# the GitHub release with the same files. Running the workflow by hand publishes
-# to TestPyPI instead, to try the pipeline without touching PyPI.
+# A tag vX.Y.Z publishes zorvex-api and then zorvex-cli at X.Y.Z to PyPI, then
+# makes the GitHub release with the same files. Running the workflow by hand
+# publishes to TestPyPI instead, to try the pipeline without touching PyPI.
 #
 # Publishing uses PyPI's trusted publishing: no token is stored here. Each
-# project on PyPI (and TestPyPI) trusts this repository's release.yml in the
-# environment named below.
+# project trusts this repository's release.yml in an environment of its own:
+#
+#   zorvex-api  ->  zorvex-api  (TestPyPI: testpypi)
+#   zorvex-cli  ->  zorvex-cli  (TestPyPI: testpypi-cli)
+#
+# One per project because PyPI keys a pending publisher (one that creates its
+# project on the first upload) by repository, workflow and environment alone:
+# two not-yet-created projects cannot share one.
 
 on:
   push:
@@ -53,43 +59,67 @@ jobs:
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: dist
-          path: dist/
+          name: dist-api
+          path: dist/zorvex_api-*
           if-no-files-found: error
 
-  pypi:
-    name: Publish to PyPI
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-cli
+          path: dist/zorvex_cli-*
+          if-no-files-found: error
+
+  pypi-api:
+    name: Publish zorvex-api to PyPI
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-latest
     environment:
-      name: pypi
-      url: https://pypi.org/p/zorvex-cli
+      name: zorvex-api
+      url: https://pypi.org/p/zorvex-api
     permissions:
       id-token: write # trusted publishing: PyPI exchanges this run's identity for an upload token
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: dist
+          name: dist-api
           path: dist/
 
-      # zorvex-api uploads before zorvex-cli, which depends on it.
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
 
-  testpypi:
-    name: Publish to TestPyPI
-    if: github.event_name == 'workflow_dispatch'
-    needs: build
+  pypi-cli:
+    name: Publish zorvex-cli to PyPI
+    # After zorvex-api: the CLI requires it, so it is on PyPI before anything can install the CLI.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: pypi-api
     runs-on: ubuntu-latest
     environment:
-      name: testpypi
-      url: https://test.pypi.org/p/zorvex-cli
+      name: zorvex-cli
+      url: https://pypi.org/p/zorvex-cli
     permissions:
       id-token: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: dist
+          name: dist-cli
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+
+  testpypi-api:
+    name: Publish zorvex-api to TestPyPI
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/zorvex-api
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-api
           path: dist/
 
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
@@ -98,16 +128,38 @@ jobs:
           # A version already on TestPyPI stays; a rerun of the same version uploads nothing.
           skip-existing: true
 
+  testpypi-cli:
+    name: Publish zorvex-cli to TestPyPI
+    if: github.event_name == 'workflow_dispatch'
+    needs: testpypi-api
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi-cli
+      url: https://test.pypi.org/p/zorvex-cli
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-cli
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
   github-release:
     name: GitHub release
-    needs: pypi
+    needs: pypi-cli
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist/
 
       - name: Create the release with the published files

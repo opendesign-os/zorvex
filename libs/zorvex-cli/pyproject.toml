@@ -1,6 +1,6 @@
 [project]
 name = "zorvex-cli"
-version = "0.12.0"
+version = "0.0.1"
 description = "Zorvex CLI - Manage your self-hosted agent deployments"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -21,7 +21,7 @@ dependencies = [
     "python-dotenv>=1.2.4",
 
     # Server (always included)
-    "zorvex-api~=0.12.0",
+    "zorvex-api~=0.0.1",
 ]
 
 [project.optional-dependencies]
