@@ -1,0 +1,4 @@
+# The repository keeps text files with LF endings whatever a checkout's
+# core.autocrlf says, so files CI regenerates on Linux (docs/openapi.json,
+# .env.example) compare equal to the committed ones.
+* text=auto

@@ -1,0 +1,79 @@
+name: CI
+
+# Lint, types, security, generated files and a package build, on every push to
+# main and every pull request. The release workflow runs it too, on the tag.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The uv the lockfile is kept with locally.
+  UV_VERSION: "0.13.9"
+
+jobs:
+  checks:
+    name: Lint, types, security, generated files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install from the lockfile
+        run: uv sync --all-packages --locked
+
+      - name: Format
+        run: uv run --no-sync ruff format --check .
+
+      - name: Lint
+        run: uv run --no-sync ruff check .
+
+      - name: Type check
+        run: uv run --no-sync ty check libs/zorvex-api/src/ libs/zorvex-cli/src/
+
+      - name: Security scan
+        run: uv run --no-sync bandit -c pyproject.toml -r libs/zorvex-api/src/ libs/zorvex-cli/src/
+
+      - name: docs/openapi.json matches the code
+        run: |
+          make openapi
+          git diff --exit-code -- docs/openapi.json
+
+      - name: .env.example matches its template
+        run: |
+          make env-example
+          git diff --exit-code -- .env.example
+
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Build zorvex-api and zorvex-cli
+        run: make build
+
+      - name: Check the metadata PyPI reads
+        run: uvx twine check dist/*

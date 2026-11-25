@@ -1,0 +1,62 @@
+# Root pyproject.toml - Workspace configuration + dev tools
+# The actual packages are in libs/zorvex-api and libs/zorvex-cli
+
+[project]
+name = "zorvex-workspace"
+version = "0.0.0"
+requires-python = ">=3.12"
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["libs/*"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.7.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "B",     # flake8-bugbear
+    "C4",    # flake8-comprehensions
+    "UP",    # pyupgrade
+    "ARG",   # flake8-unused-arguments
+    "SIM",   # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults
+    "B904",   # Within an except clause, raise exceptions with `raise ... from err`
+    "ARG001", # Unused function argument
+    "ARG002", # Unused method argument
+    "ARG005", # Unused lambda argument
+    "SIM108", # Use ternary operator (less readable in many cases)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["zorvex_api", "zorvex_cli"]
+
+# ty replaces mypy for type checking. It uses its own rule system rather than
+# mypy-style strictness flags. Severity and per-rule overrides go in
+# [tool.ty.rules]; see https://docs.astral.sh/ty/reference/rules/ for details.
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.bandit]
+exclude_dirs = [".venv"]
+skips = [
+    "B101",  # assert statements
+    "B404",  # import subprocess (needed for CLI)
+    "B603",  # subprocess without shell=True (needed for CLI)
+    "B607",  # partial executable path (needed for CLI to run docker, systemctl, etc.)
+]
