@@ -75,5 +75,5 @@ jobs:
       - name: Build zorvex-api and zorvex-cli
         run: make build
 
-      - name: Check the metadata PyPI reads
-        run: uvx twine check dist/*
+      - name: Check the metadata PyPI reads, READMEs included
+        run: uvx twine check --strict dist/*

@@ -2,6 +2,7 @@
 name = "zorvex-cli"
 version = "0.0.1"
 description = "Zorvex CLI - Manage your self-hosted agent deployments"
+readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 keywords = ["langgraph", "agents", "cli", "docker", "deployment"]
@@ -29,6 +30,11 @@ debug = ["debugpy>=1.8.22"]
 
 [project.scripts]
 zorvex = "zorvex_cli.cli:cli"
+
+[project.urls]
+Homepage = "https://github.com/opendesign-os/zorvex"
+Source = "https://github.com/opendesign-os/zorvex/tree/main/libs/zorvex-cli"
+Issues = "https://github.com/opendesign-os/zorvex/issues"
 
 [tool.uv.sources]
 zorvex-api = { workspace = true }
