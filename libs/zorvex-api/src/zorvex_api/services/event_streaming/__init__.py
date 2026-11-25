@@ -1,6 +1,5 @@
-"""Agent Protocol v2 event streaming.
+"""Agent Protocol v2 event streaming: a thread's run events over SSE and WebSocket, and its commands.
 
-Thread-scoped SSE streaming and command transport, layered over the
-existing run broker. Isolated from the legacy ``runs/stream`` path so the
-v2 logic can be reviewed and feature-flagged on its own.
+It follows the same run broker as the SDK's run streams (``/runs/stream``),
+projecting each run's native v3 events onto the channels a client subscribes to.
 """

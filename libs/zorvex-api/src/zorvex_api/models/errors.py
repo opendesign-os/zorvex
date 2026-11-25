@@ -33,23 +33,12 @@ SSE_RESPONSE: dict[int | str, dict[str, Any]] = {
     },
 }
 
-_ERROR_TYPES = {
-    400: "bad_request",
-    401: "unauthorized",
-    403: "forbidden",
-    404: "not_found",
-    405: "method_not_allowed",
-    409: "conflict",
-    422: "validation_error",
-    429: "too_many_requests",
-    500: "internal_error",
-    501: "not_implemented",
-    503: "service_unavailable",
-}
+# The statuses whose ``error`` is not their reason phrase.
+_ERROR_TYPES = {422: "validation_error", 500: "internal_error"}
 
 
 def get_error_type(status_code: int) -> str:
-    """The ``error`` of a status: a fixed name for the ones listed, else its HTTP reason phrase in snake case."""
+    """The ``error`` of a status: its HTTP reason phrase in snake case, as ``not_found`` for 404."""
     if status_code in _ERROR_TYPES:
         return _ERROR_TYPES[status_code]
     try:

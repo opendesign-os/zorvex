@@ -1,61 +1,30 @@
+# The databases `make run` (zorvex dev) develops against. The server's default
+# DATABASE_URI, postgresql://postgres:postgres@localhost:5432/zorvex, reaches this
+# PostgreSQL; set REDIS_URI=redis://localhost:6379/0 to try multi-instance mode.
+
 services:
-  # PostgreSQL database for LangGraph and metadata
   postgres:
     image: pgvector/pgvector:pg18
     restart: unless-stopped
-    # Only what the image needs; the server's DATABASE_URI below is built from the same values.
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-zorvex}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: zorvex
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d zorvex"]
       interval: 5s
       timeout: 5s
       retries: 5
 
-  # Zorvex Server
-  zorvex:
-    build:
-      context: .
-    restart: unless-stopped
-    ports:
-      - "${PORT:-2026}:${PORT:-2026}"
-    env_file:
-      - .env
-    environment:
-      - DATABASE_URI=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-zorvex}
-      - PYTHONPATH=/app/src
-      - REDIS_URI=redis://redis:6379/0
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf \"http://localhost:$${PORT:-2026}/ok?check_db=1\" || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-    volumes:
-      - ./zorvex.json:/app/zorvex.json:ro
-      - ./libs/zorvex-api/src:/app/src:ro  # Mount full src for PYTHONPATH to work
-      - ./libs/zorvex-api/alembic:/app/alembic:ro # for migrations
-    command: ["uvicorn", "zorvex_api.main:app", "--host", "0.0.0.0", "--port", "${PORT:-2026}", "--reload"]
-
-  # Redis - enables multi-instance SSE streaming with pub/sub + replay
   redis:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
       - "6379:6379"
-    volumes:
-      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -64,4 +33,3 @@ services:
 
 volumes:
   postgres_data:
-  redis_data:

@@ -1,16 +1,38 @@
 """Load what zorvex.json names as ``path/to/file.py:name`` or ``package.module:name``.
 
-One loader for the auth file, the custom HTTP app and the graphs.
+One loader for the graphs, the auth file, the priority callback and the custom
+HTTP app. Before the first of them loads, zorvex.json's ``dependencies`` go on
+``sys.path``, so each can import the project's own packages.
 """
 
 import importlib
 import importlib.util
 import sys
+from functools import cache
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from zorvex_api.config import config_dir
+import structlog
+
+from zorvex_api.config import config_dir, load_config
+
+logger = structlog.get_logger(__name__)
+
+
+@cache
+def _add_dependency_paths() -> None:
+    """Put zorvex.json's dependency directories on sys.path, the first listed first.
+
+    Relative paths resolve against the config file's directory.
+    """
+    for dependency in reversed(load_config().dependencies):
+        path = (config_dir() / dependency).resolve()
+        if not path.exists():
+            logger.warning("Dependency path does not exist", path=str(path))
+        elif str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+            logger.info("Added dependency path to sys.path", path=str(path))
 
 
 def load_object(spec: str, *, module_name: str) -> Any:
@@ -21,6 +43,7 @@ def load_object(spec: str, *, module_name: str) -> Any:
     importable module. Raises ImportError when *spec* is malformed or names
     nothing; errors raised by the module's own code propagate.
     """
+    _add_dependency_paths()
     path, sep, name = spec.rpartition(":")
     if not sep or not path or not name:
         raise ImportError(f"{spec!r} is not 'path/to/file.py:name' or 'package.module:name'")

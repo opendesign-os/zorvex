@@ -11,8 +11,7 @@ package along with the `zorvex` command.
 
 ```bash
 pip install zorvex-api
-export DATABASE_URI=postgresql://zorvex:secret@localhost:5432/zorvex
-export ZORVEX_CONFIG=./zorvex.json
+export DATABASE_URI=postgresql://zorvex:secret@localhost:5432/zorvex   # the zorvex.json in the working directory serves
 uvicorn zorvex_api.main:app --host 0.0.0.0 --port 2026
 ```
 

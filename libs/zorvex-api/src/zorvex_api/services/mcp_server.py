@@ -6,7 +6,9 @@ pauses for human input, asks the client for it as mcp_calls.py describes. Every
 step authorizes as its REST counterpart: listing as ``assistants.search``, each
 tool's schema as ``assistants.read``, and a call as ``assistants.search`` (to
 find the assistant), then as the thread and run operations it makes. The
-transport is stateless Streamable HTTP answering JSON (api/mcp.py).
+transport is stateless Streamable HTTP answering JSON (api/mcp.py); a handler
+finds its caller as the endpoint authenticated them, on the request's own ASGI
+scope.
 """
 
 from __future__ import annotations
@@ -15,8 +17,7 @@ import asyncio
 import contextlib
 import copy
 import re
-from collections.abc import AsyncGenerator, Awaitable, Callable
-from contextvars import ContextVar
+from collections.abc import Generator
 from typing import Any
 
 import mcp_types
@@ -30,17 +31,15 @@ from mcp.shared.inbound import X_MCP_HEADER_KEY
 
 from zorvex_api import __version__
 from zorvex_api.config import load_config
+from zorvex_api.core.auth import require_auth
 from zorvex_api.core.authorization import Authorization
 from zorvex_api.core.orm import get_session_maker
 from zorvex_api.models import Assistant, AssistantSearchRequest, User
 from zorvex_api.services.assistant_service import AssistantService
 from zorvex_api.services.langgraph_service import get_langgraph_service
-from zorvex_api.services.mcp_calls import AssistantTool, CallToolParams, ToolResult, pause_policy
+from zorvex_api.services.mcp_calls import CallToolParams, ToolResult, call_tool
 
 logger = structlog.getLogger(__name__)
-
-# The authenticated caller of the request being served; the route sets it around the transport.
-current_user: ContextVar[User | None] = ContextVar("mcp_current_user", default=None)
 
 _PAGE_SIZE = 100
 # A call finds its tool among this many assistants, the Agent Server's bound.
@@ -130,10 +129,11 @@ def _drop_header_keys(schema: Any) -> None:
             _drop_header_keys(item)
 
 
-async def _as_mcp_errors[T](call: Callable[[], Awaitable[T]]) -> T:
-    """Run *call*, answering a request error as invalid params with its detail, and anything else as internal."""
+@contextlib.contextmanager
+def _mcp_errors() -> Generator[None]:
+    """Answer a request error (4xx) as invalid params with its detail, and anything else as an internal error."""
     try:
-        return await call()
+        yield
     except MCPError:
         raise
     except HTTPException as exc:
@@ -146,20 +146,21 @@ async def _as_mcp_errors[T](call: Callable[[], Awaitable[T]]) -> T:
         raise MCPError(mcp_types.INTERNAL_ERROR, _INTERNAL_ERROR) from exc
 
 
-def _caller() -> User:
-    user = current_user.get()
-    if user is None:
-        raise RuntimeError("MCP request served without its authenticated caller")
-    return user
+async def _caller(context: ServerRequestContext[Any]) -> User:
+    """The request's caller, as the endpoint authenticated them: their ASGI scope keeps the user."""
+    if context.request is None:
+        raise RuntimeError("MCP request served without its HTTP request")
+    return await require_auth(context.request)
 
 
 async def _assistants(user: User, *, offset: int, limit: int) -> list[Assistant]:
     """The assistants the caller sees, as ``POST /assistants/search`` lists them."""
     async with get_session_maker()() as session:
         service = AssistantService(session, user, get_langgraph_service())
-        return await service.search_assistants(
+        assistants, _ = await service.search_assistants(
             Authorization(user, "assistants", "search"), AssistantSearchRequest(limit=limit, offset=offset)
         )
+        return assistants
 
 
 async def _tool(user: User, assistant: Assistant, name: str) -> mcp_types.Tool | None:
@@ -187,15 +188,14 @@ async def _tool(user: User, assistant: Assistant, name: str) -> mcp_types.Tool |
 
 
 async def _list_tools(
-    _context: ServerRequestContext[Any], params: mcp_types.PaginatedRequestParams | None
+    context: ServerRequestContext[Any], params: mcp_types.PaginatedRequestParams | None
 ) -> mcp_types.ListToolsResult:
     cursor = params.cursor if params is not None else None
     if cursor is not None and not _CURSOR.fullmatch(cursor):
         raise MCPError(mcp_types.INVALID_PARAMS, "Invalid cursor")
     offset = int(cursor or 0)
-    user = _caller()
-
-    async def listing() -> mcp_types.ListToolsResult:
+    with _mcp_errors():
+        user = await _caller(context)
         assistants = await _assistants(user, offset=offset, limit=_PAGE_SIZE)
         named: dict[str, Assistant] = {}
         for assistant in assistants:
@@ -210,17 +210,11 @@ async def _list_tools(
             next_cursor=str(offset + _PAGE_SIZE) if len(assistants) == _PAGE_SIZE else None,
         )
 
-    return await _as_mcp_errors(listing)
-
 
 async def _call_tool(context: ServerRequestContext[Any], params: CallToolParams) -> ToolResult:
-    user = _caller()
-
-    async def calling() -> ToolResult:
-        assistant_id = await _assistant_named(user, params.name)
-        return await pause_policy(context).call(AssistantTool(user, assistant_id), params)
-
-    return await _as_mcp_errors(calling)
+    with _mcp_errors():
+        user = await _caller(context)
+        return await call_tool(context, user, await _assistant_named(user, params.name), params)
 
 
 async def _assistant_named(user: User, name: str) -> str:
@@ -277,14 +271,6 @@ class McpTransport:
         if self._manager is None:
             raise RuntimeError("MCP transport is not running")
         await self._manager.handle_request(scope, receive, send)
-
-    @contextlib.asynccontextmanager
-    async def bound_to(self, user: User) -> AsyncGenerator[None]:
-        token = current_user.set(user)
-        try:
-            yield
-        finally:
-            current_user.reset(token)
 
 
 mcp_transport = McpTransport()

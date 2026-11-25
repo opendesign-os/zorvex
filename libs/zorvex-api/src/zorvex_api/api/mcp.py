@@ -3,8 +3,9 @@
 POST carries a JSON-RPC message and is answered with JSON. There are no
 sessions, so GET and DELETE answer 405. A browser page may reach it only from
 an origin the CORS settings name, or from a loopback one: a wildcard opens no
-origin here. The route only authenticates; each MCP operation authorizes as its
-REST counterpart (services/mcp_server.py).
+origin here. The route only authenticates, which leaves the caller on the
+request's ASGI scope for the MCP handlers to read back; each MCP operation
+authorizes as its REST counterpart (services/mcp_server.py).
 """
 
 from __future__ import annotations
@@ -14,13 +15,12 @@ from functools import cache
 from typing import Any
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from zorvex_api.config import load_config
 from zorvex_api.constants import LOOPBACK_HOSTS
-from zorvex_api.core.auth_deps import auth_dependency, require_auth
-from zorvex_api.models import User
+from zorvex_api.core.auth import auth_dependency
 from zorvex_api.services.mcp_server import mcp_transport
 
 router = APIRouter(tags=["MCP"], dependencies=auth_dependency)
@@ -63,9 +63,8 @@ class _TransportResponse(Response):
     time we get here, so the body is replayed rather than re-read.
     """
 
-    def __init__(self, user: User, body: bytes) -> None:
+    def __init__(self, body: bytes) -> None:
         super().__init__()
-        self.user = user
         self.body_bytes = body
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
@@ -78,8 +77,7 @@ class _TransportResponse(Response):
                 return {"type": "http.request", "body": self.body_bytes, "more_body": False}
             return await receive()
 
-        async with mcp_transport.bound_to(self.user):
-            await mcp_transport.handle(scope, replay, send)
+        await mcp_transport.handle(scope, replay, send)
 
 
 # One operation per method, under the Agent Server's operation ids.
@@ -87,7 +85,7 @@ class _TransportResponse(Response):
 @router.get("/mcp", response_model=None, operation_id="get_mcp")
 @router.delete("/mcp", response_model=None, operation_id="delete_mcp")
 @router.api_route("/mcp/", methods=["GET", "POST", "DELETE"], response_model=None, include_in_schema=False)
-async def mcp_endpoint(request: Request, user: User = Depends(require_auth)) -> Response:
+async def mcp_endpoint(request: Request) -> Response:
     """Send one JSON-RPC 2.0 message to the MCP server; the answer is JSON.
 
     Tools are the assistants the caller can see. A call whose run pauses for
@@ -100,4 +98,4 @@ async def mcp_endpoint(request: Request, user: User = Depends(require_auth)) -> 
         return JSONResponse({"error": "Origin is not allowed"}, status_code=403)
     if request.method != "POST":
         return Response(status_code=405, headers={"Allow": "POST"})
-    return _TransportResponse(user, await request.body())
+    return _TransportResponse(await request.body())

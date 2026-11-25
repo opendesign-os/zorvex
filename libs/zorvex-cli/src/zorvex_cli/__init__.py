@@ -1,4 +1,4 @@
-"""Zorvex CLI - Manage your self-hosted agent deployments."""
+"""The zorvex command: create, run and deploy LangGraph agents on Zorvex."""
 
 from importlib.metadata import version
 

@@ -1,7 +1,7 @@
 name: CI
 
-# Lint, types, security, generated files and a package build, on every push to
-# main and every pull request. The release workflow runs it too, on the tag.
+# Lint, types, security, the generated API spec and a package build, on every push
+# to main and every pull request. The release workflow runs it too, on the tag.
 
 on:
   push:
@@ -54,11 +54,6 @@ jobs:
         run: |
           make openapi
           git diff --exit-code -- docs/openapi.json
-
-      - name: .env.example matches its template
-        run: |
-          make env-example
-          git diff --exit-code -- .env.example
 
   build:
     name: Build distributions

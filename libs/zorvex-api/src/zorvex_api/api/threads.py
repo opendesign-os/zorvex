@@ -1,4 +1,4 @@
-"""Thread endpoints for Agent Protocol"""
+"""Thread endpoints: threads, their state and history, their stream, copies and pruning."""
 
 import re
 from collections.abc import AsyncGenerator
@@ -7,29 +7,25 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import uuid4
 
-import structlog
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
+from fastapi import APIRouter, Header, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
 from langchain_core.runnables import RunnableConfig
 from langgraph.pregel import Pregel
 from langgraph.types import StateSnapshot
-from langgraph_sdk.runtime import AccessContext
-from sqlalchemy import ColumnElement, case, exists, func, literal, select, update
+from sqlalchemy import ColumnElement
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette import EventSourceResponse
 
-from zorvex_api.core import sse
-from zorvex_api.core.auth_deps import auth_dependency, require_auth
+from zorvex_api.core import search, sse
+from zorvex_api.core.auth import auth_dependency
 from zorvex_api.core.auth_filters import build_metadata_filter
 from zorvex_api.core.authorization import Authorization, Authorize
 from zorvex_api.core.database import db_manager
-from zorvex_api.core.orm import Run as RunORM
 from zorvex_api.core.orm import SessionDep, get_session_maker
 from zorvex_api.core.orm import Thread as ThreadORM
 from zorvex_api.core.orm import ThreadTTL as ThreadTTLORM
 from zorvex_api.models import (
     Thread,
-    ThreadCheckpoint,
     ThreadCheckpointPostRequest,
     ThreadCreate,
     ThreadHistoryRequest,
@@ -42,42 +38,28 @@ from zorvex_api.models import (
     ThreadUpdate,
     User,
 )
-from zorvex_api.models.enums import ACTIVE_RUN_STATUSES
 from zorvex_api.models.errors import BAD_REQUEST, CONFLICT, NOT_FOUND, SSE_RESPONSE, AgentProtocolError
 from zorvex_api.models.threads import ThreadCountRequest, ThreadStorage, ThreadTTLInfo
-from zorvex_api.services import checkpoints, thread_events, thread_stream
-from zorvex_api.services.langgraph_service import create_thread_config, get_langgraph_service, thread_graph_config
-from zorvex_api.services.ownership import owned_thread
+from zorvex_api.services import checkpoints, thread_stream
+from zorvex_api.services.langgraph_service import get_langgraph_service
+from zorvex_api.services.ownership import owned_thread, visible_threads
 from zorvex_api.services.thread_service import ThreadService
-from zorvex_api.services.thread_state_service import snapshot_to_thread_state, snapshot_values
+from zorvex_api.services.thread_state_service import checkpoint, empty_state, record_state, snapshot_to_thread_state
 from zorvex_api.services.thread_ttl import prune_threads_by_id
 from zorvex_api.settings import settings
-from zorvex_api.utils.pagination import pagination_headers
 from zorvex_api.utils.run_utils import strip_pinned_config_keys
 
 router = APIRouter(tags=["Threads"], dependencies=auth_dependency)
-logger = structlog.getLogger(__name__)
 
 
-async def _read_thread(thread_id: str, user: User, filters: dict[str, Any] | None) -> ThreadORM:
-    """The thread, read in a short-lived session, so the caller's checkpoint ops hold no pool connection."""
-    async with get_session_maker()() as session:
-        return await owned_thread(session, thread_id, user, filters=filters)
-
-
-async def _search_conditions(request: ThreadCountRequest, authorize: Authorization) -> list[ColumnElement[bool]]:
-    """WHERE clauses of a thread search or count, after authorizing it."""
-    filters = await authorize(request.model_dump())
-    conditions: list[ColumnElement[bool]] = [ThreadORM.user_id == authorize.user.identity]
-    # Compile the handler filter rather than merging only its "metadata" key:
-    # the flat shape and the $eq/$contains/$or/$and operators were dropped here.
-    auth_filter = build_metadata_filter(ThreadORM.metadata_dict, filters)
-    if auth_filter is not None:
-        conditions.append(auth_filter)
+def _search_conditions(
+    request: ThreadCountRequest, user: User, filters: dict[str, Any] | None
+) -> list[ColumnElement[bool]]:
+    """WHERE clauses of a thread search or count: the caller's threads, the request's filters and the handler's."""
+    conditions = [visible_threads(user, filters)]
     if request.status:
         conditions.append(ThreadORM.status == request.status)
     if request.metadata:
-        # JSONB containment: type-correct, deep-nested, GIN-indexable.
         conditions.append(ThreadORM.metadata_dict.op("@>")(request.metadata))
     if request.values:
         conditions.append(ThreadORM.values.op("@>")(request.values))
@@ -95,50 +77,15 @@ async def _search_conditions(request: ThreadCountRequest, authorize: Authorizati
     return conditions
 
 
-async def _record_state_write(thread_id: str, user: User, state: StateSnapshot) -> None:
-    """A state written outside a run is the thread's: its values, its state time, its status unless a run is on it."""
-    has_next = bool(state.next)
-    values, interrupts = snapshot_values(state)
-    now = datetime.now(UTC)
-    active = exists(
-        select(RunORM.run_id)
-        .where(RunORM.thread_id == ThreadORM.thread_id, RunORM.status.in_(ACTIVE_RUN_STATUSES))
-        .correlate(ThreadORM)
-    )
-    status = case((active, ThreadORM.status), else_=literal("interrupted" if has_next else "idle"))
-    async with get_session_maker()() as session:
-        await session.execute(
-            update(ThreadORM)
-            .where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
-            .values(updated_at=now, state_updated_at=now, status=status, values=values, interrupts=interrupts)
-        )
-        await session.commit()
-
-
-def _serialize_thread(thread: ThreadORM) -> Thread:
-    """The API view of a thread row."""
-    return Thread.model_validate(
-        {
-            "thread_id": thread.thread_id,
-            "status": thread.status,
-            "metadata": thread.metadata_dict or {},
-            "created_at": thread.created_at,
-            "updated_at": thread.updated_at,
-            "state_updated_at": thread.state_updated_at,
-            "config": thread.config or {},
-            "values": thread.values or {},
-            "interrupts": thread.interrupts or {},
-            "run_priority": thread.run_priority,
-            "fairness_group": thread.fairness_group,
-        }
-    )
-
-
 async def _thread_ttl_info(session: AsyncSession, thread_id: str) -> ThreadTTLInfo | None:
-    row = await session.scalar(select(ThreadTTLORM).where(ThreadTTLORM.thread_id == thread_id))
+    row = await session.get(ThreadTTLORM, thread_id)
     if row is None:
         return None
     return ThreadTTLInfo(strategy=row.strategy, ttl_minutes=row.ttl_minutes, expires_at=row.expires_at)
+
+
+# The steps of an extract path: a key (leading or after a dot) or an [index].
+_EXTRACT_STEP = re.compile(r"\.?([^.\[\]]+)|\[(-?\d+)\]")
 
 
 def _extract(thread: dict[str, Any], path: str) -> Any:
@@ -154,18 +101,10 @@ def _extract(thread: dict[str, Any], path: str) -> Any:
     return node
 
 
-# The steps of an extract path: a key (leading or after a dot) or an [index].
-_EXTRACT_STEP = re.compile(r"\.?([^.\[\]]+)|\[(-?\d+)\]")
-
-
-# --- Endpoints ---
-
-
 @router.post("/threads", response_model=Thread, responses={**CONFLICT})
 async def create_thread(
     request: ThreadCreate,
     session: SessionDep,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "create"),
 ) -> Thread:
     """Create a new conversation thread.
@@ -175,8 +114,8 @@ async def create_thread(
     Set `if_exists` to `"do_nothing"` to return the existing thread when the
     ID already exists instead of raising a 409 conflict.
     """
-    thread = await ThreadService(session, user).create(authorize, request)
-    return _serialize_thread(thread)
+    user = authorize.user
+    return Thread.model_validate(await ThreadService(session, user).create(authorize, request))
 
 
 @router.get("/threads/{thread_id}", response_model=Thread, responses={**NOT_FOUND})
@@ -186,7 +125,6 @@ async def get_thread(
     include: str | None = Query(
         None, description="Comma-separated list of additional fields to include. Supported values: ttl"
     ),
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "read"),
 ) -> Thread:
     """Get a thread by its ID, with its current values and interrupts.
@@ -194,11 +132,9 @@ async def get_thread(
     Returns 404 if the thread does not exist or does not belong to the
     authenticated user.
     """
-    requested = {part.strip() for part in (include or "").split(",") if part.strip()}
-
-    thread = await ThreadService(session, user).get(authorize, thread_id)
-    result = _serialize_thread(thread)
-    if "ttl" in requested:
+    user = authorize.user
+    result = Thread.model_validate(await ThreadService(session, user).get(authorize, thread_id))
+    if "ttl" in {part.strip() for part in (include or "").split(",")}:
         result.ttl = await _thread_ttl_info(session, thread_id)
     return result
 
@@ -209,17 +145,14 @@ async def update_thread(
     request: ThreadUpdate,
     session: SessionDep,
     prefer: str | None = Header(None, description="return=minimal answers 204 without the thread."),
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "update"),
 ) -> Thread | Response:
     """Update a thread's metadata (merged over the existing keys) or TTL."""
+    user = authorize.user
     thread = await ThreadService(session, user).update(authorize, thread_id, request)
     if prefer and "return=minimal" in prefer.lower():
         return Response(status_code=204)
-    return _serialize_thread(thread)
-
-
-_EMPTY_CHECKPOINT_NS = ""
+    return Thread.model_validate(thread)
 
 
 @asynccontextmanager
@@ -227,27 +160,15 @@ async def _thread_graph(
     authorize: Authorization, thread_id: str, configurable: dict[str, Any] | None = None
 ) -> AsyncGenerator[tuple[Pregel, RunnableConfig] | None]:
     """Authorize, then the thread's graph bound to its config, or None before a run has bound a graph to the thread."""
-    user = authorize.user
     filters = await authorize({"thread_id": thread_id})
-    thread = await _read_thread(thread_id, user, filters)
-    graph_id = (thread.metadata_dict or {}).get("graph_id")
-    if not graph_id:
-        yield None
-        return
-    access_context: AccessContext = "threads.update" if authorize.action == "update" else "threads.read"
-    config = create_thread_config(thread_id, user)
-    config["configurable"].update(configurable or {})
-    async with get_langgraph_service().get_graph(
-        graph_id, thread_graph_config(thread.config, config), access_context=access_context, user=user
-    ) as graph:
-        yield graph.with_config(config), config
-
-
-def _empty_state(thread_id: str) -> ThreadState:
-    return ThreadState(
-        values={},
-        checkpoint=ThreadCheckpoint(checkpoint_id=None, thread_id=thread_id, checkpoint_ns=_EMPTY_CHECKPOINT_NS),
-    )
+    # A short-lived session, so the checkpoint reads that follow hold no pool connection.
+    async with get_session_maker()() as session:
+        thread = await owned_thread(session, thread_id, authorize.user, filters=filters)
+    access_context = "threads.update" if authorize.action == "update" else "threads.read"
+    async with get_langgraph_service().thread_graph(
+        thread, authorize.user, access_context=access_context, configurable=configurable
+    ) as bound:
+        yield bound
 
 
 @router.get("/threads/{thread_id}/stream", responses={**SSE_RESPONSE, **NOT_FOUND})
@@ -261,7 +182,6 @@ async def stream_thread(
         "lifecycle (each run's start and run_done), state_update (the thread's state updates).",
     ),
     stream_mode: list[str] = Query([], description="Alias of stream_modes, the name the SDKs send."),
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "read"),
 ) -> EventSourceResponse:
     """Stream the thread: each of its runs in turn, as they come, until the client goes.
@@ -270,6 +190,7 @@ async def stream_thread(
     replays every run whose events are still kept, and a run event's id
     resumes after it.
     """
+    user = authorize.user
     modes = thread_stream.parse_modes(stream_modes or stream_mode)
     if unknown := [mode for mode in modes if mode not in thread_stream.MODES]:
         raise HTTPException(422, f"Invalid stream mode: {unknown[0]}")
@@ -324,18 +245,8 @@ async def update_thread_state(
         graph, config = bound
         updated = await graph.aupdate_state(config, request.values, as_node=request.as_node)
         state = await graph.aget_state(updated)
-    await _record_state_write(thread_id, authorize.user, state)
-    await thread_events.publish(
-        thread_id, "state_update", {"state": snapshot_to_thread_state(state, thread_id), "thread_id": thread_id}
-    )
-    written = updated["configurable"]
-    return ThreadStateUpdateResponse(
-        checkpoint={
-            "checkpoint_id": written.get("checkpoint_id"),
-            "thread_id": thread_id,
-            "checkpoint_ns": written.get("checkpoint_ns", _EMPTY_CHECKPOINT_NS),
-        }
-    )
+    await record_state(thread_id, authorize.user, state)
+    return ThreadStateUpdateResponse(checkpoint=checkpoint(updated, thread_id).model_dump(exclude={"checkpoint_map"}))
 
 
 @router.get("/threads/{thread_id}/state/{checkpoint_id}", response_model=ThreadState, responses={**NOT_FOUND})
@@ -349,21 +260,19 @@ async def get_thread_state_at_checkpoint(
     return await _state(authorize, thread_id, {"checkpoint_id": checkpoint_id}, subgraphs)
 
 
-async def _state(
-    authorize: Authorization, thread_id: str, checkpoint: dict[str, Any] | None, subgraphs: bool
-) -> ThreadState:
-    """The thread's state at *checkpoint*, its latest without one; 404 for a named checkpoint that does not exist."""
-    async with _thread_graph(authorize, thread_id, checkpoint) as bound:
+async def _state(authorize: Authorization, thread_id: str, at: dict[str, Any] | None, subgraphs: bool) -> ThreadState:
+    """The thread's state at checkpoint *at*, its latest without one; 404 for a named checkpoint that does not exist."""
+    async with _thread_graph(authorize, thread_id, at) as bound:
         snapshot = None
         if bound is not None:
             graph, config = bound
             # LangGraph only exposes subgraph checkpoints while the run is interrupted.
             snapshot = await graph.aget_state(config, subgraphs=subgraphs)
-    named = (checkpoint or {}).get("checkpoint_id")
+    named = (at or {}).get("checkpoint_id")
     # A checkpoint that does not exist comes back as an empty snapshot without a creation time.
     if named and (snapshot is None or snapshot.created_at is None):
         raise HTTPException(404, f"No checkpoint '{named}' on thread '{thread_id}'")
-    return _empty_state(thread_id) if snapshot is None else snapshot_to_thread_state(snapshot, thread_id)
+    return empty_state(thread_id) if snapshot is None else snapshot_to_thread_state(snapshot, thread_id)
 
 
 @router.post("/threads/{thread_id}/state/checkpoint", response_model=ThreadState, responses={**NOT_FOUND})
@@ -373,14 +282,13 @@ async def get_thread_state_at_checkpoint_post(
     authorize: Authorization = Authorize("threads", "read"),
 ) -> ThreadState:
     """Get the thread state at the checkpoint the body names (what the SDK sends); its latest without an id."""
-    checkpoint = request.checkpoint.model_dump(include={"checkpoint_id", "checkpoint_ns", "checkpoint_map"})
-    named = {key: value for key, value in checkpoint.items() if value}
-    return await _state(authorize, thread_id, named, bool(request.subgraphs))
+    named = request.checkpoint.model_dump(include={"checkpoint_id", "checkpoint_ns", "checkpoint_map"})
+    return await _state(
+        authorize, thread_id, {key: value for key, value in named.items() if value}, bool(request.subgraphs)
+    )
 
 
-_STATE_FIELDS = frozenset(
-    {"values", "next", "tasks", "checkpoint", "metadata", "created_at", "parent_checkpoint", "interrupts"}
-)
+_STATE_FIELDS = frozenset(ThreadState.model_fields)
 _VALUE_FIELD = re.compile(r"values\.[A-Za-z0-9_-]+")
 
 
@@ -469,10 +377,10 @@ async def _history(
 async def get_thread_storage(
     thread_id: str,
     session: SessionDep,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "read"),
 ) -> ThreadStorage:
     """The bytes the thread's history takes: its checkpoints, channel values and pending writes."""
+    user = authorize.user
     await ThreadService(session, user).get(authorize, thread_id)
     return ThreadStorage.model_validate(await checkpoints.storage(thread_id))
 
@@ -491,7 +399,6 @@ async def get_thread_storage(
 async def delete_thread(
     thread_id: str,
     session: SessionDep,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "delete"),
 ) -> Response:
     """Delete a thread by its ID.
@@ -500,6 +407,7 @@ async def delete_thread(
     stored in the graph backend. Any active runs on the thread are
     automatically cancelled before deletion.
     """
+    user = authorize.user
     await ThreadService(session, user).delete(authorize, thread_id)
     return Response(status_code=204)
 
@@ -508,22 +416,20 @@ async def delete_thread(
 async def prune_threads(
     request: ThreadPruneRequest,
     session: SessionDep,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "delete"),
 ) -> ThreadPruneResponse:
     """Delete the listed threads (strategy `delete`) or compact their checkpoint history (`keep_latest`).
 
     Threads with active runs are skipped; expired threads are swept by the TTL sweeper.
     """
+    user = authorize.user
     filters = await authorize({"thread_ids": request.thread_ids})
-    auth_filter = build_metadata_filter(ThreadORM.metadata_dict, filters)
-
     count = await prune_threads_by_id(
         session,
         thread_ids=request.thread_ids,
         strategy=request.strategy,
         user_id=user.identity,
-        auth_filter=auth_filter,
+        auth_filter=build_metadata_filter(ThreadORM.metadata_dict, filters),
     )
     return ThreadPruneResponse(pruned_count=count)
 
@@ -535,18 +441,18 @@ async def count_threads(
     authorize: Authorization = Authorize("threads", "search"),
 ) -> int:
     """Count threads matching the given filters."""
-    stmt = select(func.count()).select_from(ThreadORM).where(*await _search_conditions(request, authorize))
-    return await session.scalar(stmt) or 0
+    filters = await authorize(request.model_dump())
+    return await search.count(session, ThreadORM, _search_conditions(request, authorize.user, filters))
 
 
 @router.post("/threads/{thread_id}/copy", response_model=Thread, responses={**NOT_FOUND})
 async def copy_thread(
     thread_id: str,
     session: SessionDep,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "create"),
 ) -> Thread:
     """Fork a thread: new id, same metadata and full checkpoint lineage."""
+    user = authorize.user
     filters = await authorize({"thread_id": thread_id})
     source = await owned_thread(session, thread_id, user, filters=filters)
 
@@ -561,10 +467,10 @@ async def copy_thread(
         user_id=user.identity,
         # A copy has no runs: its status follows from the state it copies.
         status="error" if source.status == "error" else "interrupted" if source.interrupts else "idle",
-        metadata_dict=dict(source.metadata_dict or {}),
-        config=dict(source.config or {}),
-        values=dict(source.values or {}),
-        interrupts=dict(source.interrupts or {}),
+        metadata_dict=dict(source.metadata_dict),
+        config=dict(source.config),
+        values=dict(source.values),
+        interrupts=dict(source.interrupts),
         created_at=now,
         updated_at=now,
         state_updated_at=now,
@@ -575,46 +481,31 @@ async def copy_thread(
     except Exception:
         await db_manager.get_checkpointer().adelete_thread(target_id)
         raise
+    return Thread.model_validate(target)
 
-    return _serialize_thread(target)
 
-
-@router.post("/threads/search", response_model=list[Thread])  # select returns a projected subset
+@router.post("/threads/search", response_model=list[Thread])
 async def search_threads(
     request: ThreadSearchRequest,
     session: SessionDep,
-    response: Response,
     authorize: Authorization = Authorize("threads", "search"),
-) -> list[Thread] | JSONResponse:
+) -> JSONResponse:
     """Search threads with filters.
 
-    Filter by status or metadata key-value pairs. Results are paginated via
-    `limit` and `offset` and ordered by `sort_by` and `sort_order` (newest first by default).
+    Filter by status, metadata, values or times. Results are paginated via
+    `limit` and `offset`, ordered by `sort_by` and `sort_order` (newest first
+    by default); `select` picks the fields returned and `extract` values from
+    each thread.
     """
-    conditions = await _search_conditions(request, authorize)
+    filters = await authorize(request.model_dump())
+    conditions = _search_conditions(request, authorize.user, filters)
     if request.ids:
         conditions.append(ThreadORM.thread_id.in_(request.ids))
-    column = getattr(ThreadORM, request.sort_by)
-    stmt = (
-        select(ThreadORM)
-        .where(*conditions)
-        # Tie-break on thread_id keeps offset pagination stable when the sort column has duplicates.
-        .order_by(column.asc() if request.sort_order == "asc" else column.desc(), ThreadORM.thread_id.asc())
-        .offset(request.offset)
-        .limit(request.limit + 1)
-    )
-    rows = (await session.scalars(stmt)).all()
-    response.headers.update(pagination_headers(len(rows), limit=request.limit, offset=request.offset))
-    rows = rows[: request.limit]
-
-    views = [_serialize_thread(row) for row in rows]
+    rows, headers = await search.page(session, ThreadORM.thread_id, conditions, request)
+    views = [Thread.model_validate(row) for row in rows]
     if request.extract:
         for view in views:
             dumped = view.model_dump(mode="json")
             view.extracted = {alias: _extract(dumped, path) for alias, path in request.extract.items()}
-    if request.select:
-        chosen = {*request.select, *(["extracted"] if request.extract else [])}
-        return JSONResponse(
-            [view.model_dump(mode="json", include=chosen) for view in views], headers=dict(response.headers)
-        )
-    return views
+    selected = [*request.select, *(["extracted"] if request.extract else [])] if request.select else None
+    return search.respond(views, headers, selected)

@@ -8,28 +8,29 @@ import contextlib
 from collections.abc import AsyncGenerator
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, Request, Response
+from fastapi import APIRouter, Body, Request, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette import EventSourceResponse
 
-from zorvex_api.api.runs import run_location, stream_response, wait_body, wait_response
-from zorvex_api.core.auth_deps import auth_dependency, require_auth
+from zorvex_api.api.runs import run_location, stream_response, wait_response
+from zorvex_api.core.auth import auth_dependency
 from zorvex_api.core.authorization import Authorization, Authorize
 from zorvex_api.core.orm import SessionDep
 from zorvex_api.models import Run, RunCreate, User
 from zorvex_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
+from zorvex_api.services import run_waiters
 from zorvex_api.services.run_cleanup import delete_thread_after_run
 from zorvex_api.services.run_preparation import prepare_stateless_run
 
 router = APIRouter(tags=["Stateless Runs"], dependencies=auth_dependency)
 
 
-async def _start(session: AsyncSession, request: RunCreate, user: User, authorize: Authorization) -> Run:
+async def _start(session: AsyncSession, request: RunCreate, authorize: Authorization) -> Run:
     """Create the run; its thread goes once the run has finished, unless kept."""
-    run = await prepare_stateless_run(session, request, user, authorize=authorize)
+    run = await prepare_stateless_run(session, request, authorize.user, authorize=authorize)
     if request.on_completion != "keep":
-        delete_thread_after_run(run, user.identity)
+        delete_thread_after_run(run, authorize.user.identity)
     return run
 
 
@@ -52,7 +53,6 @@ async def stateless_wait_for_run(
     request: RunCreate,
     session: SessionDep,
     http: Request,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "create_run"),
 ) -> StreamingResponse:
     """Create a stateless run and wait for its output.
@@ -60,18 +60,19 @@ async def stateless_wait_for_run(
     Responds as `POST /threads/{thread_id}/runs/wait` does. The run's thread
     is deleted after the output has been sent, unless `on_completion` is `"keep"`.
     """
+    user = authorize.user
     run = await prepare_stateless_run(session, request, user, authorize=authorize)
-    body = wait_body(run, user, http, request.on_disconnect)
+    leaves = http.is_disconnected if request.on_disconnect == "cancel" else None
+    body = run_waiters.wait_body(run.run_id, run.thread_id, user, is_disconnected=leaves)
     if request.on_completion != "keep":
         body = _then_delete_thread(body, run, user)
-    return wait_response(run, body)
+    return wait_response(run.thread_id, run.run_id, body)
 
 
 @router.post("/runs/stream", responses={**SSE_RESPONSE, **NOT_FOUND, **CONFLICT})
 async def stateless_stream_run(
     request: RunCreate,
     session: SessionDep,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "create_run"),
 ) -> EventSourceResponse:
     """Create a stateless run and stream its execution.
@@ -79,7 +80,7 @@ async def stateless_stream_run(
     Streams as `POST /threads/{thread_id}/runs/stream` does. The run's thread
     is deleted once the run has finished, unless `on_completion` is `"keep"`.
     """
-    run = await _start(session, request, user, authorize)
+    run = await _start(session, request, authorize)
     return stream_response(run, cancel_on_disconnect=request.on_disconnect == "cancel")
 
 
@@ -87,7 +88,6 @@ async def stateless_stream_run(
 async def stateless_create_run_batch(
     requests: Annotated[list[RunCreate], Body(min_length=1)],
     session: SessionDep,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "create_run"),
 ) -> list[Run]:
     """Create a batch of stateless background runs.
@@ -95,7 +95,7 @@ async def stateless_create_run_batch(
     Runs are created sequentially; a failure aborts the batch and the runs
     already created keep executing.
     """
-    return [await _start(session, request, user, authorize) for request in requests]
+    return [await _start(session, request, authorize) for request in requests]
 
 
 @router.post("/runs", response_model=Run, responses={**NOT_FOUND, **CONFLICT})
@@ -103,7 +103,6 @@ async def stateless_create_run(
     request: RunCreate,
     session: SessionDep,
     response: Response,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "create_run"),
 ) -> Run:
     """Create a stateless background run.
@@ -111,6 +110,6 @@ async def stateless_create_run(
     The run's thread is deleted once the run has finished, unless
     `on_completion` is `"keep"`.
     """
-    run = await _start(session, request, user, authorize)
+    run = await _start(session, request, authorize)
     response.headers.update(run_location(run))
     return run

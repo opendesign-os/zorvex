@@ -1,0 +1,31 @@
+# $project_name
+
+A LangGraph agent served by Zorvex, a self-hosted server for the LangSmith Deployment Agent Server API.
+
+## Run it
+
+```bash
+uv sync
+uv run zorvex dev
+```
+
+`zorvex dev` starts PostgreSQL with Docker or Podman, then serves the graph on <http://127.0.0.1:2026>, reloading on
+code changes; the API reference is at <http://127.0.0.1:2026/docs>. Its first run creates `.env` from `.env.example`:
+put your model provider's key there (`OPENAI_API_KEY` for `openai/...` models) and start it again.
+
+`uv run zorvex up --wait` runs it all in containers instead: PostgreSQL, Redis and the server, built from the
+`Dockerfile`.
+
+## The model
+
+The model is `provider/model`: `openai/gpt-4o-mini`, unless `MODEL` in `.env` or a run's context names another
+(`src/$slug/context.py`). Only the first slash separates the two, so `openai/deepseek-ai/DeepSeek-V3` asks provider
+`openai` for the model `deepseek-ai/DeepSeek-V3`. Set `OPENAI_BASE_URL` to have an OpenAI-compatible gateway serve
+`openai/...` models.
+
+## Layout
+
+- `zorvex.json`: the graphs Zorvex serves
+- `src/$slug/`: `graph.py` and the modules it imports
+- `.env.example`: what `.env` starts from
+- `docker-compose.yml`, `Dockerfile`: PostgreSQL, Redis and the server, for `zorvex up`

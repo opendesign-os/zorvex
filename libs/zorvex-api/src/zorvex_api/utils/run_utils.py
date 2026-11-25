@@ -1,4 +1,5 @@
 import copy
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
@@ -20,8 +21,25 @@ CRON_ID = "cron_id"
 # The W3C trace context of the request that created a run, as the Agent Server hands it to its worker.
 OTEL_TRACEPARENT = "__otel_traceparent__"
 OTEL_TRACESTATE = "__otel_tracestate__"
-# Configurable keys only the server sets: a client's are dropped.
-SERVER_KEYS = frozenset({CRON_ID, OTEL_TRACEPARENT, OTEL_TRACESTATE})
+# Configurable keys only the server sets: a client's, from the body, its context or a header, are dropped.
+SERVER_KEYS = frozenset(
+    {
+        CONTEXT_PROVIDED,
+        EVENT_STREAMING_V2,
+        LANGSMITH_PROJECT,
+        LANGSMITH_EXAMPLE_ID,
+        CRON_ID,
+        OTEL_TRACEPARENT,
+        OTEL_TRACESTATE,
+    }
+)
+
+
+def stream_modes(stream_mode: str | Sequence[str] | None) -> list[str]:
+    """A run's ``stream_mode`` as a list: one mode, several, or none."""
+    if stream_mode is None:
+        return []
+    return [stream_mode] if isinstance(stream_mode, str) else list(stream_mode)
 
 
 def strip_pinned_config_keys(client_config: dict[str, Any]) -> dict[str, Any]:
@@ -48,8 +66,8 @@ def map_command_to_langgraph(cmd: dict[str, Any]) -> Command:
     )
 
 
-def _merge_jsonb(*objects: dict | None) -> dict:
-    """Mimics PostgreSQL's JSONB merge behavior"""
+def merge_jsonb(*objects: dict | None) -> dict:
+    """The objects merged, later keys winning, as PostgreSQL's ``||`` merges JSONB; each copied deep."""
     result = {}
     for obj in objects:
         if obj is not None:
@@ -71,8 +89,8 @@ def merge_run_config(assistant_config: dict[str, Any] | None, run_config: dict[s
     a run that pins one configurable key silently drops the model, and everything
     else the assistant had set alongside it.
     """
-    merged = _merge_jsonb(assistant_config, run_config)
-    configurable = _merge_jsonb(_configurable(assistant_config), _configurable(run_config))
+    merged = merge_jsonb(assistant_config, run_config)
+    configurable = merge_jsonb(_configurable(assistant_config), _configurable(run_config))
     if configurable:
         merged["configurable"] = configurable
     return merged

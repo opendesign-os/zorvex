@@ -71,11 +71,7 @@ def _strip_null_bytes(value: Any, _depth: int = 0) -> Any:
 
 
 class JsonbSafe(TypeDecorator):
-    """JSONB column that strips NULL bytes from string values before write.
-
-    Drop-in replacement for ``JSONB``. Read path is untouched — only
-    ``process_bind_param`` runs, so existing rows are unaffected.
-    """
+    """JSONB that strips NULL bytes from the strings it writes; reads are untouched."""
 
     impl = JSONB
     cache_ok = True
@@ -101,8 +97,8 @@ class Assistant(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     graph_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # Its context is config["configurable"].
     config: Mapped[dict] = mapped_column(JsonbSafe, server_default=text("'{}'::jsonb"))
-    context: Mapped[dict] = mapped_column(JsonbSafe, server_default=text("'{}'::jsonb"))
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
     metadata_dict: Mapped[dict] = mapped_column(JsonbSafe, server_default=text("'{}'::jsonb"), name="metadata")
@@ -124,7 +120,6 @@ class AssistantVersion(Base):
     version: Mapped[int] = mapped_column(Integer, primary_key=True)
     graph_id: Mapped[str] = mapped_column(Text, nullable=False)
     config: Mapped[dict] = mapped_column(JsonbSafe, nullable=False, server_default=text("'{}'::jsonb"))
-    context: Mapped[dict] = mapped_column(JsonbSafe, nullable=False, server_default=text("'{}'::jsonb"))
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     metadata_dict: Mapped[dict] = mapped_column(JsonbSafe, server_default=text("'{}'::jsonb"), name="metadata")
     name: Mapped[str] = mapped_column(Text, nullable=False)
@@ -191,12 +186,12 @@ class Run(Base):
     cancel_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
-        Index("idx_run_thread_id", "thread_id"),
-        Index("idx_run_user", "user_id"),
+        # A thread's runs in order: every per-thread read, and the thread cascade.
+        Index("idx_run_thread_created", "thread_id", "created_at"),
+        # The assistant cascade.
         Index("idx_run_assistant_id", "assistant_id"),
-        Index("idx_run_created_at", "created_at"),
-        # Also serves status-only filters through its leading column.
-        Index("idx_run_lease_reaper", "status", "lease_expires_at"),
+        # Runs by status (pending, running) and the expired leases among them.
+        Index("idx_run_status_lease", "status", "lease_expires_at"),
     )
 
 

@@ -2,43 +2,49 @@
 
 from datetime import UTC, datetime
 from typing import Any, Literal, Self
-from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from croniter import croniter
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from zorvex_api.models.enums import (
-    CronSortBy,
-    Durability,
-    MultitaskStrategy,
-    OnCompletionBehavior,
-    SortOrder,
-    StreamMode,
-)
-from zorvex_api.models.runs import RunCreate
-from zorvex_api.models.search import SearchLimit, SearchOffset
+from zorvex_api.models.entity_ids import MAX_ENTITY_ID_LENGTH
+from zorvex_api.models.enums import CronSortBy, Durability, MultitaskStrategy, OnCompletionBehavior, StreamMode
+from zorvex_api.models.runs import RunCreate, redact_webhook_url
+from zorvex_api.models.search import SearchPage
 from zorvex_api.settings import settings
 
-# Field length caps. Keep these conservative; cron metadata is small by nature.
 _SCHEDULE_MAX_LEN = 256
 _TIMEZONE_MAX_LEN = 64
-_WEBHOOK_MAX_LEN = 2048
-_ASSISTANT_ID_MAX_LEN = 256
 
 
-def _validate_webhook_url(value: str | None) -> str | None:
-    """Reject malformed or non-http(s) webhook URLs at the API boundary.
+def is_seconds_schedule(schedule: str) -> bool:
+    """Whether *schedule* has six fields, seconds first."""
+    return len(schedule.split()) == 6
 
-    The cron record stores ``webhook`` verbatim and every fired run calls it.
-    The server's webhooks.url policy is applied on top, in CronService.
-    """
-    if value is None:
+
+def _check_schedule(schedule: str | None) -> str | None:
+    """A schedule croniter can step through, of six fields only when CRON_ALLOW_SECONDS_SCHEDULE is on."""
+    if schedule is None:
         return None
-    parsed = urlparse(value)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError("webhook must use http or https scheme")
-    if not parsed.netloc:
-        raise ValueError("webhook must include a host")
-    return value
+    seconds = is_seconds_schedule(schedule)
+    if seconds and not settings.cron.CRON_ALLOW_SECONDS_SCHEDULE:
+        raise ValueError("6-field (seconds) cron schedules are disabled; set CRON_ALLOW_SECONDS_SCHEDULE to allow them")
+    try:
+        # Some invalid expressions only fail when stepped through.
+        croniter(schedule, datetime.now(UTC), second_at_beginning=seconds).get_next(datetime)
+    except (ValueError, KeyError):
+        raise ValueError(f"Invalid cron schedule: {schedule}") from None
+    return schedule
+
+
+def _check_timezone(timezone: str | None) -> str | None:
+    """An IANA timezone name."""
+    if timezone is not None:
+        try:
+            ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, KeyError, ValueError):
+            raise ValueError(f"Invalid timezone: {timezone}") from None
+    return timezone
 
 
 class _CronFields(BaseModel):
@@ -49,7 +55,7 @@ class _CronFields(BaseModel):
     context: dict[str, Any] | None = None
     interrupt_before: Literal["*"] | list[str] | None = None
     interrupt_after: Literal["*"] | list[str] | None = None
-    webhook: str | None = Field(None, max_length=_WEBHOOK_MAX_LEN)
+    webhook: str | None = None
     end_time: datetime | None = None
     enabled: bool | None = None
     stream_mode: StreamMode | list[StreamMode] | None = None
@@ -58,9 +64,7 @@ class _CronFields(BaseModel):
     timezone: str | None = Field(None, max_length=_TIMEZONE_MAX_LEN)
     durability: Durability | None = None
 
-    # A field validator, unlike assigning in _check, keeps "webhook" out of model_fields_set when it
-    # was omitted, so update_cron can tell an omitted webhook from an explicit null that removes it.
-    _check_webhook = field_validator("webhook")(_validate_webhook_url)
+    _timezone = field_validator("timezone")(_check_timezone)
 
     @model_validator(mode="after")
     def _check(self) -> Self:
@@ -92,23 +96,25 @@ CRON_RUN_FIELDS: frozenset[str] = frozenset(
 )
 
 
-class CronCreate(_CronFields):
-    """A cron whose every run goes on a new thread (POST /runs/crons)."""
-
-    assistant_id: str = Field(..., max_length=_ASSISTANT_ID_MAX_LEN)
+class _NewCron(_CronFields):
+    assistant_id: str = Field(..., max_length=MAX_ENTITY_ID_LENGTH)
     schedule: str = Field(..., max_length=_SCHEDULE_MAX_LEN)
     input: Any = None
+
+    _schedule = field_validator("schedule")(_check_schedule)
+
+
+class CronCreate(_NewCron):
+    """A cron whose every run goes on a new thread (POST /runs/crons)."""
+
     on_run_completed: OnCompletionBehavior = Field(
         "delete", description="What happens to a run's thread once the run completes: 'delete' (default) or 'keep'."
     )
 
 
-class ThreadCronCreate(_CronFields):
+class ThreadCronCreate(_NewCron):
     """A cron whose runs all go on one thread (POST /threads/{thread_id}/runs/crons)."""
 
-    assistant_id: str = Field(..., max_length=_ASSISTANT_ID_MAX_LEN)
-    schedule: str = Field(..., max_length=_SCHEDULE_MAX_LEN)
-    input: Any = None
     multitask_strategy: MultitaskStrategy | None = None
 
 
@@ -118,6 +124,8 @@ class CronUpdate(_CronFields):
     schedule: str | None = Field(None, max_length=_SCHEDULE_MAX_LEN)
     input: Any = None
     on_run_completed: OnCompletionBehavior | None = None
+
+    _schedule = field_validator("schedule")(_check_schedule)
 
 
 class CronResponse(BaseModel):
@@ -137,8 +145,16 @@ class CronResponse(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     user_id: str | None = None
     next_run_date: datetime | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict, validation_alias=AliasChoices("metadata_dict", "metadata"))
     enabled: bool = True
+
+    @field_validator("payload")
+    @classmethod
+    def _redact(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        """The webhook without its credentials or query, which often carry the receiver's token."""
+        if webhook := payload.get("webhook"):
+            return {**payload, "webhook": redact_webhook_url(webhook)}
+        return payload
 
 
 CronSelectField = Literal[
@@ -167,15 +183,12 @@ class CronCountRequest(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
-class CronSearchRequest(CronCountRequest):
+class CronSearchRequest(CronCountRequest, SearchPage[CronSelectField]):
     """Request body for searching cron jobs."""
 
-    enabled: bool | None = None
-    limit: SearchLimit = 10
-    offset: SearchOffset = 0
     sort_by: CronSortBy = Field("created_at", description="Field to sort by.")
-    sort_order: SortOrder = Field("desc", description="Sort direction.")
-    select: list[CronSelectField] | None = Field(None, description="Fields to return; all when omitted")
+
+    enabled: bool | None = None
 
 
 if (

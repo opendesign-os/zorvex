@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Zorvex",
-    "description": "Production-ready Agent Protocol server",
+    "description": "The LangGraph Agent Server API, self-hosted",
     "version": "0.0.2"
   },
   "paths": {
@@ -237,7 +237,7 @@
           "Assistants"
         ],
         "summary": "Search Assistants",
-        "description": "Search assistants with filters.\n\nFilter by name, description, graph ID, or metadata. Results are paginated\nvia `limit` and `offset`.",
+        "description": "Search assistants with filters.\n\nFilter by name, graph ID, or metadata. Results are paginated via `limit`\nand `offset`, and `select` picks the fields returned.",
         "operationId": "search_assistants_assistants_search_post",
         "requestBody": {
           "content": {
@@ -704,7 +704,7 @@
           "Assistants"
         ],
         "summary": "List Assistant Versions",
-        "description": "List all versions of an assistant.\n\nReturns versions ordered from newest to oldest. Each version captures the\nassistant's configuration at the time of creation or update.",
+        "description": "List the versions of an assistant, newest first.\n\nEach version captures the assistant's configuration at the time of its\ncreation or update. `limit` and `offset` page them, and `metadata` keeps\nthe versions whose metadata contains it.",
         "operationId": "list_assistant_versions_assistants__assistant_id__versions_post",
         "parameters": [
           {
@@ -717,6 +717,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/AssistantVersionsRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Request"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -877,12 +894,10 @@
                 },
                 {
                   "type": "integer"
-                },
-                {
-                  "type": "null"
                 }
               ],
               "description": "Expand subgraph nodes. Pass true or a depth integer to control nesting.",
+              "default": false,
               "title": "Xray"
             },
             "description": "Expand subgraph nodes. Pass true or a depth integer to control nesting."
@@ -2418,7 +2433,7 @@
           "Threads"
         ],
         "summary": "Search Threads",
-        "description": "Search threads with filters.\n\nFilter by status or metadata key-value pairs. Results are paginated via\n`limit` and `offset` and ordered by `sort_by` and `sort_order` (newest first by default).",
+        "description": "Search threads with filters.\n\nFilter by status, metadata, values or times. Results are paginated via\n`limit` and `offset`, ordered by `sort_by` and `sort_order` (newest first\nby default); `select` picks the fields returned and `extract` values from\neach thread.",
         "operationId": "search_threads_threads_search_post",
         "requestBody": {
           "content": {
@@ -3995,7 +4010,7 @@
           "Crons"
         ],
         "summary": "Update Cron",
-        "description": "Update an existing cron job.\n\nOnly provided fields are updated (partial patch). Returns the full\n``Cron`` object after update.",
+        "description": "Change the fields the request sets and return the whole cron; an explicit null clears end_time or the webhook.",
         "operationId": "update_cron_runs_crons__cron_id__patch",
         "parameters": [
           {
@@ -4213,7 +4228,7 @@
           "Crons"
         ],
         "summary": "Search Crons",
-        "description": "Search cron jobs with filters and pagination.",
+        "description": "Search cron jobs with filters and pagination; `select` picks the fields returned.",
         "operationId": "search_crons_runs_crons_search_post",
         "requestBody": {
           "content": {
@@ -4952,16 +4967,12 @@
                       "GetTask",
                       "ListTasks",
                       "SendMessage",
-                      "SendStreamingMessage",
-                      "message/send",
-                      "message/stream",
-                      "tasks/cancel",
-                      "tasks/get"
+                      "SendStreamingMessage"
                     ]
                   },
                   "params": {
                     "type": "object",
-                    "description": "Method parameters, as the A2A 1.0 (or 0.3) spec defines them. SendMessage and SendStreamingMessage also take `context`, the run's context, and the message a `command` (resume, update or goto), the LangGraph Command it runs with."
+                    "description": "Method parameters, as the A2A 1.0 spec defines them. SendMessage and SendStreamingMessage also take `context`, the run's context, and the message a `command` (resume, update or goto), the LangGraph Command it runs with."
                   }
                 }
               }
@@ -5415,12 +5426,6 @@
             "title": "Config",
             "description": "Configuration passed to the graph at runtime."
           },
-          "context": {
-            "additionalProperties": true,
-            "type": "object",
-            "title": "Context",
-            "description": "Context variables available to the graph during execution."
-          },
           "graph_id": {
             "type": "string",
             "title": "Graph Id",
@@ -5448,6 +5453,13 @@
             "format": "date-time",
             "title": "Updated At",
             "description": "Timestamp when the assistant was last updated."
+          },
+          "context": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Context",
+            "description": "Context variables available to the graph during execution: config.configurable.",
+            "readOnly": true
           }
         },
         "type": "object",
@@ -5457,10 +5469,11 @@
           "graph_id",
           "version",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "context"
         ],
         "title": "Assistant",
-        "description": "Assistant entity model"
+        "description": "Assistant entity model; an assistant version has the same shape."
       },
       "AssistantCountRequest": {
         "properties": {
@@ -5571,7 +5584,7 @@
               }
             ],
             "title": "Context",
-            "description": "Assistant context"
+            "description": "Assistant context; the same as config.configurable, which it replaces."
           },
           "graph_id": {
             "type": "string",
@@ -5611,6 +5624,58 @@
       },
       "AssistantSearchRequest": {
         "properties": {
+          "limit": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "description": "Maximum number of results.",
+            "default": 10
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Offset",
+            "description": "Number of results to skip.",
+            "default": 0
+          },
+          "sort_order": {
+            "type": "string",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "description": "Sort direction.",
+            "default": "desc"
+          },
+          "select": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "assistant_id",
+                    "graph_id",
+                    "name",
+                    "description",
+                    "config",
+                    "context",
+                    "created_at",
+                    "updated_at",
+                    "metadata",
+                    "version"
+                  ]
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Select",
+            "description": "Fields to return; all fields when omitted."
+          },
           "name": {
             "anyOf": [
               {
@@ -5648,21 +5713,6 @@
             "title": "Metadata",
             "description": "Assistants whose metadata contains these pairs."
           },
-          "limit": {
-            "type": "integer",
-            "maximum": 1000.0,
-            "minimum": 1.0,
-            "title": "Limit",
-            "description": "Maximum number of results.",
-            "default": 10
-          },
-          "offset": {
-            "type": "integer",
-            "minimum": 0.0,
-            "title": "Offset",
-            "description": "Number of results to skip.",
-            "default": 0
-          },
           "sort_by": {
             "type": "string",
             "enum": [
@@ -5675,43 +5725,6 @@
             "title": "Sort By",
             "description": "Field to sort by.",
             "default": "created_at"
-          },
-          "sort_order": {
-            "type": "string",
-            "enum": [
-              "asc",
-              "desc"
-            ],
-            "title": "Sort Order",
-            "description": "Sort direction.",
-            "default": "desc"
-          },
-          "select": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string",
-                  "enum": [
-                    "assistant_id",
-                    "graph_id",
-                    "name",
-                    "description",
-                    "config",
-                    "context",
-                    "created_at",
-                    "updated_at",
-                    "metadata",
-                    "version"
-                  ]
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Select",
-            "description": "Fields to return; all fields when omitted"
           }
         },
         "type": "object",
@@ -5721,9 +5734,17 @@
       "AssistantUpdate": {
         "properties": {
           "name": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Name",
-            "description": "The name of the assistant. Unchanged when omitted."
+            "description": "The name of the assistant. Unchanged when omitted or null."
           },
           "description": {
             "anyOf": [
@@ -5751,9 +5772,17 @@
             "description": "Configuration to use for the graph. Unchanged when omitted."
           },
           "graph_id": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Graph Id",
-            "description": "The ID of the graph. Unchanged when omitted."
+            "description": "The ID of the graph. Unchanged when omitted or null."
           },
           "context": {
             "anyOf": [
@@ -5766,7 +5795,7 @@
               }
             ],
             "title": "Context",
-            "description": "The context to use for the graph. Useful when graph is configurable. Unchanged when omitted."
+            "description": "The context to use for the graph: config.configurable, which it replaces. Unchanged when omitted."
           },
           "metadata": {
             "anyOf": [
@@ -5784,7 +5813,42 @@
         },
         "type": "object",
         "title": "AssistantUpdate",
-        "description": "Request model for partially updating assistants.\n\nEvery field is optional and defaults to ``None`` so that an omitted field\nis distinguishable from an explicit one via ``model_dump(exclude_unset=True)``:\nomitting ``config`` keeps the stored config, sending ``{\"config\": {}}`` clears it.\n\nA null clears ``description`` and reads as empty for the other dict fields.\n``name`` and ``graph_id`` back NOT NULL columns and refuse one."
+        "description": "Request model for partially updating assistants.\n\nAn omitted field keeps its stored value (read with ``exclude_unset``), so\n``{\"config\": {}}`` clears the config. A null clears ``description``, reads\nas empty for the dict fields, and leaves ``name`` and ``graph_id`` as they are."
+      },
+      "AssistantVersionsRequest": {
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "description": "Maximum number of results.",
+            "default": 10
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Offset",
+            "description": "Number of results to skip.",
+            "default": 0
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata",
+            "description": "Versions whose metadata contains these pairs."
+          }
+        },
+        "type": "object",
+        "title": "AssistantVersionsRequest",
+        "description": "Request body of POST /assistants/{assistant_id}/versions: a page of versions, newest first."
       },
       "Body_set_assistant_latest_assistants__assistant_id__latest_post": {
         "properties": {
@@ -5967,8 +6031,7 @@
           "webhook": {
             "anyOf": [
               {
-                "type": "string",
-                "maxLength": 2048
+                "type": "string"
               },
               {
                 "type": "null"
@@ -6094,7 +6157,7 @@
           },
           "assistant_id": {
             "type": "string",
-            "maxLength": 256,
+            "maxLength": 255,
             "title": "Assistant Id"
           },
           "schedule": {
@@ -6249,51 +6312,6 @@
       },
       "CronSearchRequest": {
         "properties": {
-          "assistant_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Assistant Id"
-          },
-          "thread_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Thread Id"
-          },
-          "metadata": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Metadata"
-          },
-          "enabled": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Enabled"
-          },
           "limit": {
             "type": "integer",
             "maximum": 1000.0,
@@ -6308,21 +6326,6 @@
             "title": "Offset",
             "description": "Number of results to skip.",
             "default": 0
-          },
-          "sort_by": {
-            "type": "string",
-            "enum": [
-              "cron_id",
-              "assistant_id",
-              "thread_id",
-              "created_at",
-              "updated_at",
-              "next_run_date",
-              "end_time"
-            ],
-            "title": "Sort By",
-            "description": "Field to sort by.",
-            "default": "created_at"
           },
           "sort_order": {
             "type": "string",
@@ -6363,7 +6366,67 @@
               }
             ],
             "title": "Select",
-            "description": "Fields to return; all when omitted"
+            "description": "Fields to return; all fields when omitted."
+          },
+          "assistant_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assistant Id"
+          },
+          "thread_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thread Id"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          },
+          "sort_by": {
+            "type": "string",
+            "enum": [
+              "cron_id",
+              "assistant_id",
+              "thread_id",
+              "created_at",
+              "updated_at",
+              "next_run_date",
+              "end_time"
+            ],
+            "title": "Sort By",
+            "description": "Field to sort by.",
+            "default": "created_at"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
           }
         },
         "type": "object",
@@ -6447,8 +6510,7 @@
           "webhook": {
             "anyOf": [
               {
-                "type": "string",
-                "maxLength": 2048
+                "type": "string"
               },
               {
                 "type": "null"
@@ -8047,7 +8109,7 @@
               }
             ],
             "title": "Supersteps",
-            "description": "Checkpoint history to seed the thread with. Each superstep is {\"updates\": [{\"values\": ..., \"as_node\": ...}]}. Requires graph_id or assistant_id in metadata."
+            "description": "Checkpoint history to seed the thread with. Each superstep is {\"updates\": [{\"values\": ..., \"as_node\": ...}]}. Requires graph_id in metadata."
           }
         },
         "type": "object",
@@ -8131,8 +8193,7 @@
           "webhook": {
             "anyOf": [
               {
-                "type": "string",
-                "maxLength": 2048
+                "type": "string"
               },
               {
                 "type": "null"
@@ -8258,7 +8319,7 @@
           },
           "assistant_id": {
             "type": "string",
-            "maxLength": 256,
+            "maxLength": 255,
             "title": "Assistant Id"
           },
           "schedule": {
@@ -8410,6 +8471,59 @@
       },
       "ThreadSearchRequest": {
         "properties": {
+          "limit": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "description": "Maximum number of results.",
+            "default": 10
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Offset",
+            "description": "Number of results to skip.",
+            "default": 0
+          },
+          "sort_order": {
+            "type": "string",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "description": "Sort direction.",
+            "default": "desc"
+          },
+          "select": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "thread_id",
+                    "created_at",
+                    "updated_at",
+                    "state_updated_at",
+                    "metadata",
+                    "config",
+                    "status",
+                    "values",
+                    "interrupts",
+                    "run_priority",
+                    "fairness_group"
+                  ]
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Select",
+            "description": "Fields to return; all fields when omitted."
+          },
           "metadata": {
             "anyOf": [
               {
@@ -8526,21 +8640,6 @@
             "title": "Status",
             "description": "Thread status filter (idle, busy, interrupted, error)"
           },
-          "limit": {
-            "type": "integer",
-            "maximum": 1000.0,
-            "minimum": 1.0,
-            "title": "Limit",
-            "description": "Maximum number of results.",
-            "default": 10
-          },
-          "offset": {
-            "type": "integer",
-            "minimum": 0.0,
-            "title": "Offset",
-            "description": "Number of results to skip.",
-            "default": 0
-          },
           "sort_by": {
             "type": "string",
             "enum": [
@@ -8551,18 +8650,8 @@
               "state_updated_at"
             ],
             "title": "Sort By",
-            "description": "Field to sort by",
+            "description": "Field to sort by.",
             "default": "created_at"
-          },
-          "sort_order": {
-            "type": "string",
-            "enum": [
-              "asc",
-              "desc"
-            ],
-            "title": "Sort Order",
-            "description": "Sort direction",
-            "default": "desc"
           },
           "ids": {
             "anyOf": [
@@ -8578,34 +8667,6 @@
             ],
             "title": "Ids",
             "description": "Restrict results to these thread IDs"
-          },
-          "select": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string",
-                  "enum": [
-                    "thread_id",
-                    "created_at",
-                    "updated_at",
-                    "state_updated_at",
-                    "metadata",
-                    "config",
-                    "status",
-                    "values",
-                    "interrupts",
-                    "run_priority",
-                    "fairness_group"
-                  ]
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Select",
-            "description": "Fields to return; all fields when omitted"
           },
           "extract": {
             "anyOf": [

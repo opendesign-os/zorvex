@@ -1,6 +1,5 @@
 """A run's graph streamed in the Agent Server's run stream modes, as ``(mode, payload)`` events."""
 
-import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import aclosing
 from typing import Any
@@ -12,7 +11,6 @@ from langchain_core.messages import (
     BaseMessageChunk,
     ToolMessage,
     ToolMessageChunk,
-    convert_to_messages,
     message_chunk_to_message,
 )
 from langchain_core.runnables import RunnableConfig
@@ -35,7 +33,7 @@ async def stream_graph_events(
     ``events`` adds astream_events' events. A subgraph's events carry
     ``|namespace`` after their mode. *options* go to astream as they are.
     """
-    run_id = str(config.get("configurable", {}).get("run_id", uuid.uuid4()))
+    run_id = str(config["configurable"]["run_id"])
     requested = set(stream_mode)
     modes = requested - {"events", "messages-tuple"}
     if "messages-tuple" in requested:
@@ -95,22 +93,13 @@ def _messages(chunk: Any, suffix: str, *, tuples: bool, seen: dict[Any, Any]) ->
             chunk = (_as_chunk(message), metadata)
         return [("messages" + suffix, chunk)]
     message, metadata = chunk
-    streamed = False
-    if isinstance(message, dict):
-        role = str(message.get("role", "")).lower()
-        if "chunk" in f"{message.get('type', '')}{role}".lower():
-            kind = AIMessageChunk if "ai" in role else ToolMessageChunk if "tool" in role else BaseMessageChunk
-            message = kind(**message)
-            streamed = True
-        else:
-            message = convert_to_messages([message])[0]
     events: list[tuple[str, Any]] = []
     if message.id in seen:
         seen[message.id] += message
     else:
         seen[message.id] = message
         events.append(("messages/metadata", {message.id: {"metadata": metadata}}))
-    whole = seen[message.id] if streamed else message_chunk_to_message(seen[message.id])
+    whole = message_chunk_to_message(seen[message.id])
     events.append(("messages/partial" if isinstance(message, BaseMessageChunk) else "messages/complete", [whole]))
     return events
 

@@ -1,13 +1,14 @@
-"""Tool calls whose run pauses for human input, carried over MCP as the Agent Server carries them.
+"""Tool calls over MCP, as the Agent Server answers them: the run's values, or its pause for human input.
 
-How a pause is answered depends on the client (``pause_policy``):
+A call runs the assistant and answers its final values. How a pause is
+answered depends on the client (``call_tool``):
 
 - before protocol 2026-07-28 nothing can carry the questions: the call runs
   on a throwaway thread, and a pause is reported, with its interrupts, as an
-  error result (``ReportPause``);
+  error result;
 - a 2026-07-28 client without elicitation is told the tool needs it: error
-  -32021, naming the modes the questions take (``RequireElicitation``);
-- a 2026-07-28 client with elicitation is asked (``ElicitAnswers``): the call
+  -32021, naming the modes the questions take;
+- a 2026-07-28 client with elicitation is asked (``ElicitingCall``): the call
   runs on a thread of its own, and a pause answers ``input_required`` with the
   round's requests (mcp_elicitation.py) and a ``requestState``. The client
   calls again with the answers and that state; the answers resume the run,
@@ -22,6 +23,9 @@ the token, so retrying the same answers joins that run rather than starting
 another, and each round's token is derived from the last. A paused call's
 thread lives a day; once the call ends it is deleted, or, when the end came on
 a retry, left to expire within ten minutes.
+
+The first section, what a run came to and the threads and runs its caller
+reads and starts, serves the A2A server (a2a_service.py) too.
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ import json
 import secrets
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import Any
 from uuid import UUID, uuid5
 
 import anyio
@@ -52,16 +56,22 @@ from zorvex_api.core.orm import get_session_maker
 from zorvex_api.core.serializers import to_jsonable
 from zorvex_api.models import ThreadCreate, ThreadTTLSpec, ThreadUpdate, User
 from zorvex_api.models.runs import RunCreate
-from zorvex_api.services.executor import executor
 from zorvex_api.services.mcp_elicitation import EndCall, Mode, Refusal, Round, UnaskableInterrupt, digest
-from zorvex_api.services.ownership import owned_run
+from zorvex_api.services.ownership import authorized_run, authorized_thread
 from zorvex_api.services.run_cleanup import delete_thread_after_run
-from zorvex_api.services.run_preparation import Launch, prepare_run, prepare_stateless_run
-from zorvex_api.services.run_waiters import ERROR_KEY, INTERRUPT_KEY, run_result
+from zorvex_api.services.run_preparation import Launch, create_run
+from zorvex_api.services.run_waiters import (
+    Completed,
+    Failed,
+    Paused,
+    RunOutcome,
+    public_interrupt,
+    run_outcome,
+    wait_for_result,
+)
 from zorvex_api.services.thread_service import ThreadService
 from zorvex_api.services.thread_state_service import read_thread_values
 from zorvex_api.services.thread_ttl import get_thread_ttl_config
-from zorvex_api.settings import settings
 
 logger = structlog.getLogger(__name__)
 
@@ -80,7 +90,8 @@ _TOKEN_BYTES = 32
 _STORED_LABEL = b"stored"
 _NEXT_ROUND_LABEL = b"next-round"
 
-ToolResult = mcp_types.CallToolResult | mcp_types.InputRequiredResult
+
+# --- a call's results
 
 
 class CallToolParams(mcp_types.CallToolRequestParams):
@@ -101,56 +112,30 @@ class CallToolParams(mcp_types.CallToolRequestParams):
         return digest(assistant_id, self.name, self.input)
 
 
-# --- what a run came to
+ToolResult = mcp_types.CallToolResult | mcp_types.InputRequiredResult
+# What a call's run came to: the questions its pause asks, or the call's result.
+Step = Paused | mcp_types.CallToolResult
 
 
-@dataclass(frozen=True, slots=True)
-class Completed:
-    output: Any
-
-    def tool_result(self) -> mcp_types.CallToolResult:
-        return mcp_types.CallToolResult(content=[_text(_json(self.output))])
-
-
-@dataclass(frozen=True, slots=True)
-class Failed:
-    message: str
-
-    def tool_result(self) -> mcp_types.CallToolResult:
-        return mcp_types.CallToolResult(content=[_text(self.message)], is_error=True)
+def _step(outcome: RunOutcome) -> Step:
+    match outcome:
+        case Paused():
+            return outcome
+        case Failed(error):
+            return _error_result(_error_message(error))
+        case Completed(values):
+            return mcp_types.CallToolResult(content=[_text(_json(values))])
 
 
-@dataclass(frozen=True, slots=True)
-class Paused:
-    interrupts: tuple[dict[str, Any], ...]
-
-    def notice(self, message: str) -> mcp_types.CallToolResult:
-        """The pause as an error result: *message*, then the interrupts as JSON."""
-        return mcp_types.CallToolResult(content=[_text(message), _text(_json(list(self.interrupts)))], is_error=True)
+def _error_result(message: str) -> mcp_types.CallToolResult:
+    return mcp_types.CallToolResult(content=[_text(message)], is_error=True)
 
 
-Finished = Completed | Failed
-RunOutcome = Completed | Failed | Paused
-
-
-def parse_outcome(body: Any) -> RunOutcome:
-    """A wait's result as what the run came to: its error, the interrupts it paused on, or its values."""
-    if isinstance(body, dict) and set(body) == {ERROR_KEY}:
-        return Failed(_error_message(body[ERROR_KEY]))
-    interrupts = body.get(INTERRUPT_KEY) if isinstance(body, dict) else None
-    if isinstance(interrupts, list) and interrupts:
-        return Paused(tuple(_interrupt(item) for item in interrupts))
-    return Completed(body)
-
-
-def _interrupt(item: Any) -> dict[str, Any]:
-    """An interrupt as the Agent Server reports one: its id and value, and its response schema when it has one."""
-    if not isinstance(item, dict):
-        return {"id": None, "value": item}
-    reported = {"id": item.get("id"), "value": item.get("value")}
-    if item.get("response_schema") is not None:
-        reported["response_schema"] = item["response_schema"]
-    return reported
+def _reported(step: Step, notice: str) -> mcp_types.CallToolResult:
+    """The call's result, a pause reported as an error: *notice*, then the interrupts as JSON."""
+    if isinstance(step, Paused):
+        return mcp_types.CallToolResult(content=[_text(notice), _text(_json(list(step.interrupts)))], is_error=True)
+    return step
 
 
 def _error_message(error: Any) -> str:
@@ -168,25 +153,12 @@ def _text(text: str) -> mcp_types.TextContent:
     return mcp_types.TextContent(type="text", text=text)
 
 
-async def _wait_result(run_id: str, thread_id: str, user: User) -> Any:
-    """The run's result once it ends, as ``POST /runs/wait`` answers it."""
-    timed_out = False
-    try:
-        await executor.wait_for_completion(run_id, timeout=settings.worker.BG_JOB_TIMEOUT_SECS)
-    except TimeoutError:
-        timed_out = True
-    return await run_result(run_id, thread_id, user, timed_out=timed_out)
-
-
-async def run_stateless(user: User, assistant_id: str, params: CallToolParams) -> RunOutcome:
+async def run_stateless(user: User, assistant_id: str, params: CallToolParams) -> Step:
     """Run the assistant on a throwaway thread and answer what it came to, as ``POST /runs/wait`` does."""
     request = RunCreate(assistant_id=assistant_id, input=params.input, context=params.context)
-    async with get_session_maker()() as session:
-        run = await prepare_stateless_run(
-            session, request, user, authorize=Authorization(user, "threads", "create_run")
-        )
+    run = await create_run(Authorization(user, "threads", "create_run"), None, request)
     try:
-        return parse_outcome(await _wait_result(run.run_id, run.thread_id, user))
+        return _step(run_outcome(await wait_for_result(run.run_id, run.thread_id, user)))
     finally:
         # The result is read from the thread, so the thread goes only after it.
         delete_thread_after_run(run, user.identity)
@@ -313,10 +285,7 @@ class CallThread:
 
     async def get(self) -> ThreadORM:
         with _invalid_state_if_missing():
-            async with get_session_maker()() as session:
-                return await ThreadService(session, self.user).get(
-                    Authorization(self.user, "threads", "read"), self.thread_id
-                )
+            return await authorized_thread(Authorization(self.user, "threads", "read"), self.thread_id)
 
     async def pending(self, thread: ThreadORM) -> list[dict[str, Any]]:
         """The interrupts the thread waits on, in task order; none unless it is interrupted."""
@@ -333,17 +302,14 @@ class CallThread:
             return
         await self._update(binding.metadata, PAUSED_CALL_TTL_MINUTES)
 
-    async def run(self, params: CallToolParams) -> RunOutcome:
+    async def run(self, params: CallToolParams) -> Step:
         request = RunCreate(
             assistant_id=self.assistant_id, input=params.input, context=params.context, durability="exit"
         )
-        async with get_session_maker()() as session:
-            run = await prepare_run(
-                session, self.thread_id, request, self.user, authorize=Authorization(self.user, "threads", "create_run")
-            )
-        return await self._outcome(await _wait_result(run.run_id, self.thread_id, self.user))
+        run = await create_run(Authorization(self.user, "threads", "create_run"), self.thread_id, request)
+        return await self._outcome(await wait_for_result(run.run_id, self.thread_id, self.user))
 
-    async def resume(self, value: Any, state: RequestState, context: dict[str, Any] | None) -> RunOutcome:
+    async def resume(self, value: Any, state: RequestState, context: dict[str, Any] | None) -> Step:
         """Resume the run with the round's answers; a retry of the same answers joins the run they started."""
         request = RunCreate(
             assistant_id=self.assistant_id,
@@ -353,16 +319,9 @@ class CallThread:
             if_not_exists="reject",
             durability="exit",
         )
+        authorize = Authorization(self.user, "threads", "create_run")
         try:
-            async with get_session_maker()() as session:
-                await prepare_run(
-                    session,
-                    self.thread_id,
-                    request,
-                    self.user,
-                    authorize=Authorization(self.user, "threads", "create_run"),
-                    launch=Launch(run_id=str(state.run_id)),
-                )
+            await create_run(authorize, self.thread_id, request, launch=Launch(run_id=str(state.run_id)))
         except HTTPException as exc:
             if exc.status_code == 404:
                 raise InvalidRequestState from None
@@ -371,19 +330,15 @@ class CallThread:
             return await self.join(state)
         return await self._wait_for(state)
 
-    async def join(self, state: RequestState) -> RunOutcome:
+    async def join(self, state: RequestState) -> Step:
         if not await self.resumed_with(state):
             raise InvalidRequestState
         return await self._wait_for(state)
 
     async def resumed_with(self, state: RequestState) -> bool:
         """Whether the round's answers already started their run."""
-        run_id = str(state.run_id)
-        authorize = Authorization(self.user, "threads", "read")
         try:
-            async with get_session_maker()() as session:
-                filters = await authorize({"thread_id": self.thread_id, "run_id": run_id})
-                await owned_run(session, self.thread_id, run_id, self.user, filters=filters)
+            await authorized_run(Authorization(self.user, "threads", "read"), self.thread_id, str(state.run_id))
         except HTTPException as exc:
             if exc.status_code != 404:
                 raise
@@ -418,22 +373,22 @@ class CallThread:
             if exc.status_code != 404:
                 logger.warning(failure, thread_id=self.thread_id, status_code=exc.status_code)
 
-    async def _wait_for(self, state: RequestState) -> RunOutcome:
-        return await self._outcome(await _wait_result(str(state.run_id), self.thread_id, self.user))
+    async def _wait_for(self, state: RequestState) -> Step:
+        return await self._outcome(await wait_for_result(str(state.run_id), self.thread_id, self.user))
 
-    async def _outcome(self, body: Any) -> RunOutcome:
+    async def _outcome(self, result: dict[str, Any]) -> Step:
         """What the run came to, read from the thread once it is done: a pause asks the thread's own interrupts."""
-        outcome = parse_outcome(body)
+        outcome = run_outcome(result)
         if isinstance(outcome, Failed):
-            return outcome
+            return _step(outcome)
         thread = await self.get()
         if thread.status == "busy":
             raise InvalidRequestState
         if thread.status == "interrupted":
             if interrupts := await self.pending(thread):
-                return Paused(tuple(_interrupt(item) for item in interrupts))
-            return Failed(BREAKPOINT_MESSAGE)
-        return outcome
+                return Paused(tuple(public_interrupt(item) for item in interrupts))
+            return _error_result(BREAKPOINT_MESSAGE)
+        return _step(outcome)
 
 
 # --- how a pause is answered
@@ -457,120 +412,56 @@ class ElicitationRequired(MCPError):
         )
 
 
-@dataclass(frozen=True, slots=True)
-class ElicitationModes:
-    """The elicitation modes a client declared."""
-
-    declared: frozenset[Mode]
-
-    @classmethod
-    def of(cls, capabilities: mcp_types.ClientCapabilities | None) -> ElicitationModes:
-        elicitation = capabilities.elicitation if capabilities else None
-        if elicitation is None:
-            return cls(frozenset())
-        declared: set[Mode] = set()
-        if elicitation.form is not None:
-            declared.add("form")
-        if elicitation.url is not None:
-            declared.add("url")
-        # An elicitation capability naming no mode is the older form-only one.
-        return cls(frozenset(declared) or frozenset({"form"}))
-
-    def require(self, needed: frozenset[Mode]) -> None:
-        if not needed <= self.declared:
-            raise ElicitationRequired(needed)
+def elicitation_modes(capabilities: mcp_types.ClientCapabilities | None) -> frozenset[Mode]:
+    """The elicitation modes a client declared; an elicitation capability naming none is the older form-only one."""
+    elicitation = capabilities.elicitation if capabilities else None
+    if elicitation is None:
+        return frozenset()
+    declared: set[Mode] = set()
+    if elicitation.form is not None:
+        declared.add("form")
+    if elicitation.url is not None:
+        declared.add("url")
+    return frozenset(declared) or frozenset({"form"})
 
 
-@dataclass(frozen=True, slots=True)
-class AssistantTool:
-    """One assistant, called as a tool by one user."""
-
-    user: User
-    assistant_id: str
-
-    async def run_once(self, params: CallToolParams) -> RunOutcome:
-        return await run_stateless(self.user, self.assistant_id, params)
-
-    async def new_thread(self) -> CallThread:
-        return await CallThread.create(self.user, self.assistant_id)
-
-    def thread(self, thread_id: str) -> CallThread:
-        return CallThread(self.user, self.assistant_id, thread_id)
-
-
-class PausePolicy(Protocol):
-    async def call(self, tool: AssistantTool, params: CallToolParams) -> ToolResult: ...
-
-
-@dataclass(frozen=True, slots=True)
-class ReportPause:
-    """Run once; a pause is reported, as *notice* and the interrupts."""
-
-    notice: str
-
-    async def call(self, tool: AssistantTool, params: CallToolParams) -> ToolResult:
+async def call_tool(
+    context: ServerRequestContext[Any], user: User, assistant_id: str, params: CallToolParams
+) -> ToolResult:
+    """Run the assistant as a tool for *user*; a pause is answered as the client can take it (module doc)."""
+    if context.protocol_version not in MODERN_PROTOCOL_VERSIONS:
+        # Nothing carries questions to a client before 2026-07-28, nor a retry from it.
         if params.request_state is not None:
             raise InvalidRequestState
-        outcome = await tool.run_once(params)
-        if isinstance(outcome, Paused):
-            return outcome.notice(self.notice)
-        return outcome.tool_result()
-
-
-@dataclass(frozen=True, slots=True)
-class RequireElicitation:
-    """Run once; a pause the client could answer with elicitation is -32021, naming the modes it needs."""
-
-    async def call(self, tool: AssistantTool, params: CallToolParams) -> ToolResult:
-        if params.request_state is not None:
-            return await ElicitAnswers(ElicitationModes(frozenset())).call(tool, params)
-        outcome = await tool.run_once(params)
-        if not isinstance(outcome, Paused):
-            return outcome.tool_result()
-        try:
-            needed = Round.of(outcome.interrupts).modes
-        except UnaskableInterrupt as error:
-            return Failed(error.message).tool_result()
-        raise ElicitationRequired(needed)
-
-
-@dataclass(frozen=True, slots=True)
-class ElicitAnswers:
-    """Run on a thread of the call's own, and ask the client each round's questions."""
-
-    modes: ElicitationModes
-
-    async def call(self, tool: AssistantTool, params: CallToolParams) -> ToolResult:
-        if params.request_state is None:
-            return await self._start(tool, params)
+        return _reported(await run_stateless(user, assistant_id, params), PAUSED_TOOL_MESSAGE)
+    modes = elicitation_modes(context.session.client_capabilities)
+    if params.request_state is not None:
         state = RequestState.parse(params.request_state)
-        thread = tool.thread(str(state.thread_id))
-        call = ElicitingCall(
-            thread, params, state, modes=self.modes, answers=params.answers, release=thread.expire_soon
-        )
-        return await call.retry()
-
-    async def _start(self, tool: AssistantTool, params: CallToolParams) -> ToolResult:
-        try:
-            thread = await tool.new_thread()
-        except HTTPException as exc:
-            if exc.status_code != 403:
-                raise
-            # Not allowed a thread to pause on: the call can only report a pause.
-            return await ReportPause(UNRESUMABLE_PAUSE_MESSAGE).call(tool, params)
-        state = RequestState.new(thread.thread_id)
-        call = ElicitingCall(thread, params, state, modes=self.modes, answers=params.answers, release=thread.delete)
-        return await call.first()
+        thread = CallThread(user, assistant_id, str(state.thread_id))
+        return await ElicitingCall(thread, params, state, modes, release=thread.expire_soon).retry()
+    if not modes:
+        return await _require_elicitation(user, assistant_id, params)
+    try:
+        thread = await CallThread.create(user, assistant_id)
+    except HTTPException as exc:
+        if exc.status_code != 403:
+            raise
+        # Not allowed a thread to pause on: the call can only report a pause.
+        return _reported(await run_stateless(user, assistant_id, params), UNRESUMABLE_PAUSE_MESSAGE)
+    state = RequestState.new(thread.thread_id)
+    return await ElicitingCall(thread, params, state, modes, release=thread.delete).first()
 
 
-def pause_policy(context: ServerRequestContext[Any]) -> PausePolicy:
-    """How this request's client can answer a pause."""
-    if context.protocol_version not in MODERN_PROTOCOL_VERSIONS:
-        return ReportPause(PAUSED_TOOL_MESSAGE)
-    modes = ElicitationModes.of(context.session.client_capabilities)
-    if not modes.declared:
-        return RequireElicitation()
-    return ElicitAnswers(modes)
+async def _require_elicitation(user: User, assistant_id: str, params: CallToolParams) -> ToolResult:
+    """Run once; a pause the client could answer with elicitation is -32021, naming the modes it needs."""
+    step = await run_stateless(user, assistant_id, params)
+    if not isinstance(step, Paused):
+        return step
+    try:
+        needed = Round.of(step.interrupts).modes
+    except UnaskableInterrupt as error:
+        return _error_result(error.message)
+    raise ElicitationRequired(needed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -580,16 +471,21 @@ class ElicitingCall:
     thread: CallThread
     params: CallToolParams
     state: RequestState
-    modes: ElicitationModes
-    answers: Mapping[str, mcp_types.InputResponse]
+    modes: frozenset[Mode]
     release: Callable[[], Awaitable[None]]
     verified: Binding | None = None
+    # Whether the request's answers are for this round; a round the call moves on to has none yet.
+    answering: bool = True
+
+    @property
+    def answers(self) -> Mapping[str, mcp_types.InputResponse]:
+        return self.params.answers if self.answering else {}
 
     async def first(self) -> ToolResult:
         try:
             return await self._settle(await self.thread.run(self.params))
         except UnaskableInterrupt as error:
-            return await self._finish(Failed(error.message))
+            return await self._finish(_error_result(error.message))
         except BaseException:
             with anyio.CancelScope(shield=True):
                 await self.release()
@@ -599,7 +495,7 @@ class ElicitingCall:
         snapshot = await self.thread.get()
         binding = Binding.verified(snapshot.metadata_dict, self._call_digest, self.state)
         if binding.ended is not None:
-            return Failed(EndCall(binding.ended).message).tool_result()
+            return _error_result(EndCall(binding.ended).message)
         call = replace(self, verified=binding)
         try:
             if binding.admits(self._call_digest, self.state):
@@ -618,28 +514,28 @@ class ElicitingCall:
                     return await self._answer(pending)
                 if not await self.thread.resumed_with(self.state):
                     # The thread asks something this round did not: ask that instead.
-                    return await replace(self, answers={})._answer(pending)
-            outcome = await self.thread.join(self.state)
-            return await self._next()._settle(outcome)
+                    return await replace(self, answering=False)._answer(pending)
+            return await self._next()._settle(await self.thread.join(self.state))
         except UnaskableInterrupt as error:
-            return await self._finish(Failed(error.message))
+            return await self._finish(_error_result(error.message))
 
-    async def _settle(self, outcome: RunOutcome) -> ToolResult:
-        if isinstance(outcome, Paused):
-            return await self._answer(Round.of(outcome.interrupts))
-        return await self._finish(outcome)
+    async def _settle(self, step: Step) -> ToolResult:
+        if isinstance(step, Paused):
+            return await self._answer(Round.of(step.interrupts))
+        return await self._finish(step)
 
     async def _answer(self, pending: Round) -> ToolResult:
-        self.modes.require(pending.modes)
+        if not pending.modes <= self.modes:
+            raise ElicitationRequired(pending.modes)
         if not pending.answered_by(self.answers):
             return await self._ask(pending)
         reply = pending.reply(self.answers)
         if isinstance(reply, EndCall):
             ending = Binding.of(self._call_digest, self.state, pending, reply.refusal)
             await self.thread.bind(ending, self.verified)
-            return await self._finish(Failed(reply.message))
-        outcome = await self.thread.resume(reply.value, self.state, self.params.context)
-        return await self._next()._settle(outcome)
+            return await self._finish(_error_result(reply.message))
+        step = await self.thread.resume(reply.value, self.state, self.params.context)
+        return await self._next()._settle(step)
 
     async def _ask(self, pending: Round) -> ToolResult:
         try:
@@ -647,16 +543,16 @@ class ElicitingCall:
         except HTTPException as exc:
             if exc.status_code != 403:
                 raise
-            return await self._finish(Failed(UNRESUMABLE_PAUSE_MESSAGE))
+            return await self._finish(_error_result(UNRESUMABLE_PAUSE_MESSAGE))
         return mcp_types.InputRequiredResult(input_requests=pending.input_requests, request_state=str(self.state))
 
-    async def _finish(self, outcome: Finished) -> mcp_types.CallToolResult:
+    async def _finish(self, result: mcp_types.CallToolResult) -> mcp_types.CallToolResult:
         await self.release()
-        return outcome.tool_result()
+        return result
 
     @property
     def _call_digest(self) -> str:
         return self.params.digest(self.thread.assistant_id)
 
     def _next(self) -> ElicitingCall:
-        return replace(self, state=self.state.next(), answers={})
+        return replace(self, state=self.state.next(), answering=False)

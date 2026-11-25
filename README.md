@@ -26,13 +26,13 @@ You need Python 3.12 or later, and Docker or Podman for the local PostgreSQL.
 uv tool install zorvex-cli            # or: pip install zorvex-cli
 zorvex new ./my-agent -t react-agent
 cd my-agent
-cp .env.example .env                  # set OPENAI_API_KEY, or your model's key
 uv sync
 uv run zorvex dev
 ```
 
 `zorvex dev` starts PostgreSQL in a container when it is not running yet, then serves the project's graphs on
-<http://127.0.0.1:2026>, reloading on code changes. The API reference is at <http://127.0.0.1:2026/docs>.
+<http://127.0.0.1:2026>, reloading on code changes. The API reference is at <http://127.0.0.1:2026/docs>. The first
+run creates `.env` from `.env.example`: set `OPENAI_API_KEY` there, or your model provider's key.
 
 Talk to it with the LangGraph SDK (`pip install langgraph-sdk`):
 
@@ -59,18 +59,8 @@ asyncio.run(main())
 
 ## The `zorvex` command
 
-| Command | What it does |
-|---|---|
-| `zorvex new [PATH]` | Creates a project from a template (`-t simple-chatbot` or `-t react-agent`) |
-| `zorvex dev` | Runs the development server with reload, starting PostgreSQL if needed |
-| `zorvex serve` | Runs the production server, as a container's command |
-| `zorvex up [SERVICES]` | Builds and starts PostgreSQL and the server with Docker or Podman Compose |
-| `zorvex down` | Stops them (`-v` also removes their volumes) |
-| `zorvex validate` | Checks `zorvex.json` |
-| `zorvex db upgrade \| downgrade \| current \| history` | Database migrations |
-
-`zorvex <command> --help` lists each command's options. Docker or Podman is picked automatically; set
-`ZORVEX_CONTAINER_RUNTIME=docker` or `podman` to choose.
+`zorvex new`, `dev`, `serve`, `up`, `down`, `validate` and `db`: what each does, and its options, are in the
+[zorvex-cli README](libs/zorvex-cli/README.md); `zorvex <command> --help` lists them too.
 
 ## Configuration
 
@@ -112,7 +102,7 @@ The server reads its settings from the environment. The ones you are likely to s
 | Variable | Default | |
 |---|---|---|
 | `DATABASE_URI` | `postgresql://postgres:postgres@localhost:5432/zorvex` | PostgreSQL, as a libpq URL |
-| `REDIS_URI` | unset | Set it to run several instances, with runs on workers |
+| `REDIS_URI` | unset | Redis 5.0 or later; set it to run several instances, with runs on workers |
 | `ZORVEX_CONFIG` | `zorvex.json` | The project file |
 | `RUN_MIGRATIONS_ON_STARTUP` | `true` | Apply database migrations as the server starts |
 | `N_JOBS_PER_WORKER` | `10` | Runs a worker executes at once |
@@ -143,9 +133,9 @@ Zorvex follows the Agent Server API of LangSmith Deployment (`langgraph-api` 0.1
 their request fields and answers, and every call the LangGraph SDK makes. The spec is
 [`docs/openapi.json`](docs/openapi.json).
 
-Not supported: JavaScript graphs, custom or MongoDB checkpointers and custom stores, encryption at rest, and
-LangSmith API-key authentication. The LangSmith control plane (deployments, revisions, autoscaling) is not part of
-Zorvex.
+Not supported: JavaScript graphs, custom or MongoDB checkpointers and custom stores, encryption at rest,
+LangSmith API-key authentication, and A2A 0.3: the A2A endpoint speaks A2A 1.0 only. The LangSmith control plane
+(deployments, revisions, autoscaling) is not part of Zorvex.
 
 ## Developing Zorvex
 
@@ -163,9 +153,9 @@ make run            # zorvex dev on this repository's zorvex.json
 | `docs/openapi.json` | The API spec, generated with `make openapi` |
 | `scripts/` | The spec export and the release version check |
 
-`make ci-check` runs CI's code checks: format, lint, types (ty) and security (bandit). After a change to the API, run
-`make openapi`; CI fails when the committed spec differs from the code. `make build` builds both packages into
-`dist/`.
+`make check` runs CI's checks: format, lint, types (ty), security (bandit) and the API spec, which `make openapi`
+regenerates after a change to the API; `make format` fixes what it can. `make build` builds both packages into
+`dist/`. `make run` develops against the PostgreSQL of this repository's `docker-compose.yml`.
 
 ### Releasing
 

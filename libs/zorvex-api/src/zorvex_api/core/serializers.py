@@ -17,10 +17,8 @@ def to_jsonable(obj: Any) -> Any:
     # A class (e.g. a Pydantic class passed to with_structured_output) is named, not dumped.
     if inspect.isclass(obj):
         return f"{obj.__module__}.{obj.__qualname__}"
-    if hasattr(obj, "model_dump") and callable(obj.model_dump):  # Pydantic v2
+    if hasattr(obj, "model_dump") and callable(obj.model_dump):  # Pydantic models, LangChain messages
         return to_jsonable(obj.model_dump())
-    if hasattr(obj, "dict") and callable(obj.dict):  # LangChain objects, Pydantic v1
-        return to_jsonable(obj.dict())
     if dataclasses.is_dataclass(obj):  # LangGraph Interrupt, Command, Send
         return {field.name: to_jsonable(getattr(obj, field.name)) for field in dataclasses.fields(obj)}
     if hasattr(obj, "_asdict") and callable(obj._asdict):  # NamedTuples such as PregelTask

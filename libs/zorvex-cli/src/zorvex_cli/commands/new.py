@@ -1,9 +1,10 @@
-"""Initialize a new Zorvex project with interactive template selection."""
+"""``zorvex new``: a project from a template."""
 
 import json
 import logging
+import os
+import re
 import sys
-from collections.abc import Mapping, Sequence
 from pathlib import Path
 from string import Template
 
@@ -11,28 +12,24 @@ import click
 from rich.console import Console
 
 from zorvex_cli import __version__
-from zorvex_cli.templates import (
-    get_docker_compose,
-    get_dockerfile,
-    get_template_choices,
-    load_shared_file,
-    load_template_manifest,
-    render_env_example,
-    render_shared_template_file,
-    render_template_file,
-    slugify,
-)
+from zorvex_cli.templates import SHARED_FILES, TEMPLATES, docker_files, render
 
 console = Console()
 logger = logging.getLogger(__name__)
 
 
-def _is_interactive() -> bool:
-    """Check if running in an interactive terminal.
+def slugify(name: str) -> str:
+    """A Python identifier for *name*: "My Project" -> "my_project", "MyApp 2.0" -> "myapp_20"."""
+    slug = name.lower().replace(" ", "_").replace("-", "_")
+    slug = re.sub(r"[^a-z0-9_]", "", slug)
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    if slug and slug[0].isdigit():
+        slug = "project_" + slug
+    return slug or "zorvex_project"
 
-    Returns:
-        True if stdin is a TTY, False otherwise (CI, piped input, etc.).
-    """
+
+def _is_interactive() -> bool:
+    """Whether stdin is a terminal, so questions can be asked (not in CI or with piped input)."""
     try:
         return sys.stdin.isatty()
     except (AttributeError, ValueError):
@@ -40,70 +37,22 @@ def _is_interactive() -> bool:
         return False
 
 
-def _resolve_name(path: Path, name: str | None) -> str:
-    """Determine project name from explicit --name or from the path.
-
-    Args:
-        path: Resolved project directory.
-        name: Explicit name from CLI flag, or None.
-
-    Returns:
-        Human-readable project name.
-    """
-    if name is not None:
-        return name
-    return path.name
-
-
-def _prompt_path(default: str) -> str:
-    """Interactively ask the user where to create the project.
-
-    Args:
-        default: Default path shown in the prompt.
-
-    Returns:
-        User-chosen path string.
-    """
-    value = click.prompt(
-        click.style("\U0001f4c2 Where should I create the project?", bold=True),
-        default=default,
-    )
-    return value
-
-
-def _prompt_template(templates: Sequence[Mapping[str, str]]) -> int:
-    """Interactively ask the user to pick a template.
-
-    Args:
-        templates: List of template dicts with name and description.
-
-    Returns:
-        1-based template index.
-    """
+def _prompt_template() -> str:
+    """Ask which template to start from."""
     click.echo()
-    click.echo(click.style("\U0001f31f Choose a template:", bold=True))
-    for i, t in enumerate(templates, 1):
-        click.echo(f"  {i}. {t['name']} \u2014 {t['description']}")
+    click.echo(click.style("Choose a template:", bold=True))
+    for number, template in enumerate(TEMPLATES.values(), 1):
+        click.echo(f"  {number}. {template.name} - {template.description}")
     click.echo()
-    choice = click.prompt("Enter your choice", default=1, type=int)
-    return choice
+    number = click.prompt("Enter your choice", default=1, type=click.IntRange(1, len(TEMPLATES)))
+    return list(TEMPLATES)[number - 1]
 
 
 def _write_file(path: Path, content: str, force: bool) -> bool:
-    """Write content to a file, respecting the force flag.
-
-    Args:
-        path: Path to write to.
-        content: Content to write.
-        force: Whether to overwrite existing files.
-
-    Returns:
-        True if file was written, False if skipped.
-    """
+    """Write *content* to *path* unless it exists and *force* is off; whether it was written."""
     if path.exists() and not force:
         console.print(f"  [yellow]SKIP[/yellow]    {path}")
         return False
-
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     console.print(f"  [green]CREATE[/green]  {path}")
@@ -115,7 +64,7 @@ def _write_file(path: Path, content: str, force: bool) -> bool:
 @click.option(
     "--template",
     "-t",
-    type=click.Choice([choice["id"] for choice in get_template_choices()]),
+    type=click.Choice(list(TEMPLATES)),
     default=None,
     help="The template to start from; asked for when omitted.",
 )
@@ -124,20 +73,14 @@ def _write_file(path: Path, content: str, force: bool) -> bool:
 def new(path: str, template: str | None, name: str | None, force: bool) -> None:
     """Create a new Zorvex project from a template.
 
-    Creates a complete project structure from a template, including:
-
     \b
-    - zorvex.json: Graph configuration
-    - pyproject.toml: Project dependencies
-    - .env.example: Environment variable template
-    - .gitignore: Standard Python gitignore
-    - README.md: Project readme
-    - src/<slug>/__init__.py: Package init
-    - src/<slug>/graph.py: Template-specific graph
-    - src/<slug>/state.py, prompts.py, context.py, utils.py: Shared modules
-    - src/<slug>/tools.py: Tool definitions (ReAct agent only)
-    - docker-compose.yml: Docker Compose (PostgreSQL + API)
-    - Dockerfile: Production container build
+    - zorvex.json: the graphs Zorvex serves
+    - pyproject.toml, README.md, .gitignore
+    - .env.example: what .env starts from (the first `zorvex dev` creates .env)
+    - src/<slug>/graph.py: the template's graph
+    - src/<slug>/state.py, prompts.py, context.py, utils.py: the modules it imports
+    - src/<slug>/tools.py: its tools (ReAct agent only)
+    - docker-compose.yml, Dockerfile, .dockerignore: PostgreSQL, Redis and the server
 
     Examples:
 
@@ -148,97 +91,51 @@ def new(path: str, template: str | None, name: str | None, force: bool) -> None:
         zorvex new ./my-agent -t react-agent        # ReAct Agent
         zorvex new ./my-agent -t simple-chatbot -n "My Agent"
     """
-    templates = get_template_choices()
     interactive = _is_interactive()
 
-    # --- Resolve path (interactive if default ".") ---
-    # Prompt for path when using default "." in interactive mode,
-    # unless both --template and --name are given (full automation).
+    # Ask where, unless the path, or both the template and the name, are given.
     if path == "." and interactive and not (template and name):
-        path = _prompt_path(".")
+        path = click.prompt(click.style("Where should I create the project?", bold=True), default=".")
     project_path = Path(path).resolve()
 
-    # --- Resolve template: the named one, else asked for (the first when not interactive) ---
-    if template is not None:
-        selected = next(choice for choice in templates if choice["id"] == template)
-    else:
-        number = _prompt_template(templates) if interactive else 1
-        if not 1 <= number <= len(templates):
-            console.print(f"[bold red]Error:[/bold red] Invalid template number: {number}")
-            raise SystemExit(1)
-        selected = templates[number - 1]
-    click.echo(f"You selected: {selected['name']} \u2014 {selected['description']}")
+    # The named template, else the one chosen (the first when nobody can be asked).
+    if template is None:
+        template = _prompt_template() if interactive else next(iter(TEMPLATES))
+    selected = TEMPLATES[template]
+    click.echo(f"You selected: {selected.name} - {selected.description}")
 
-    # --- Resolve project name ---
-    project_name = _resolve_name(project_path, name)
+    project_name = name or project_path.name
     slug = slugify(project_name)
-
-    # Template variables
-    variables = {
-        "project_name": project_name,
-        "slug": slug,
-        "zorvex_version": __version__,
+    variables = {"project_name": project_name, "slug": slug, "zorvex_version": __version__}
+    config = {"name": project_name, "dependencies": ["./src"], "graphs": {slug: f"./src/{slug}/graph.py:graph"}}
+    files = {
+        "zorvex.json": json.dumps(config, indent=2) + "\n",
+        **{
+            Template(destination).substitute(variables): render(source, variables)
+            for source, destination in {**SHARED_FILES, **selected.files}.items()
+        },
+        **docker_files(),
     }
 
     click.echo()
-    click.echo(click.style("\U0001f4e5 Creating project...", bold=True))
+    click.echo(click.style("Creating project...", bold=True))
+    created = sum(_write_file(project_path / relative, content, force) for relative, content in files.items())
 
-    files_created = 0
-    files_skipped = 0
-
-    def _write(rel_path: str, content: str) -> None:
-        nonlocal files_created, files_skipped
-        full = project_path / rel_path
-        if _write_file(full, content, force):
-            files_created += 1
-        else:
-            files_skipped += 1
-
-    # --- zorvex.json ---
-    zorvex_config = {
-        "name": project_name,
-        "dependencies": ["./src"],
-        "graphs": {slug: f"./src/{slug}/graph.py:graph"},
-    }
-    _write("zorvex.json", json.dumps(zorvex_config, indent=2) + "\n")
-
-    # --- Template files (from manifest) ---
-    manifest = load_template_manifest(selected["id"])
-    for template_filename, dest_pattern in manifest["files"].items():
-        dest = Template(dest_pattern).safe_substitute(variables)
-        content = render_template_file(selected["id"], template_filename, variables)
-        _write(dest, content)
-
-    # --- Shared template files (from manifest) ---
-    for shared_filename, dest_pattern in manifest.get("shared_files", {}).items():
-        dest = Template(dest_pattern).safe_substitute(variables)
-        content = render_shared_template_file(shared_filename, variables)
-        _write(dest, content)
-
-    # --- .env.example ---
-    _write(".env.example", render_env_example(variables))
-
-    # --- .gitignore ---
-    _write(".gitignore", load_shared_file("gitignore"))
-
-    # --- Docker files ---
-    _write("docker-compose.yml", get_docker_compose(slug))
-    _write("Dockerfile", get_dockerfile())
-
-    # --- Summary ---
     click.echo()
-    click.echo(f"\U0001f389 New project created at {project_path}")
+    click.echo(f"New project created at {project_path}")
     click.echo()
-
-    if files_skipped:
-        console.print(
-            f"[green]{files_created}[/green] files created, "
-            f"[yellow]{files_skipped}[/yellow] files skipped"
-        )
+    if created < len(files):
+        console.print(f"[green]{created}[/green] files created, [yellow]{len(files) - created}[/yellow] files skipped")
         click.echo()
 
     click.echo(click.style("Next steps:", bold=True))
-    click.echo(f"  cd {project_path.name}")
-    click.echo("  cp .env.example .env       # Configure your environment")
+    if project_path != Path.cwd().resolve():
+        try:
+            location = os.path.relpath(project_path)
+        except ValueError:  # on another drive, on Windows
+            location = str(project_path)
+        click.echo(f"  cd {location}")
     click.echo("  uv sync                    # Install dependencies")
-    click.echo("  uv run zorvex dev           # Start developing!")
+    click.echo("  uv run zorvex dev          # Start developing!")
+    click.echo()
+    click.echo("The first `zorvex dev` creates .env from .env.example: put your model provider's key there.")

@@ -1,7 +1,7 @@
 [project]
 name = "zorvex-api"
 version = "0.0.2"
-description = "Zorvex core API - Self-hosted Agent Protocol server"
+description = "The Zorvex server: the LangGraph Agent Server API, self-hosted on PostgreSQL"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -37,8 +37,7 @@ dependencies = [
     # Database
     "sqlalchemy>=2.1.9",
     "greenlet>=3.5.6",
-    "asyncpg>=0.32.0",
-    "psycopg[binary]>=3.3.9",
+    "psycopg[binary,pool]>=3.3.9",
     "alembic>=1.20.1",
 
     # Observability (OpenTelemetry)
@@ -90,45 +89,3 @@ packages = ["src/zorvex_api"]
 [tool.hatch.build.targets.wheel.force-include]
 "alembic.ini" = "zorvex_api/alembic.ini"
 "alembic" = "zorvex_api/alembic"
-
-[tool.ruff]
-line-length = 120
-target-version = "py312"
-
-[tool.ruff.format]
-# This package's [tool.ruff] overrides the root config for files beneath it, so
-# the markdown exclusion has to be repeated here. See the root pyproject.toml.
-exclude = ["**/*.md"]
-
-[tool.ruff.lint]
-select = [
-    "E",     # pycodestyle errors
-    "W",     # pycodestyle warnings
-    "F",     # pyflakes
-    "I",     # isort
-    "B",     # flake8-bugbear
-    "C4",    # flake8-comprehensions
-    "UP",    # pyupgrade
-    "ARG",   # flake8-unused-arguments
-    "SIM",   # flake8-simplify
-]
-ignore = [
-    "E501",   # line too long (handled by formatter)
-    "B008",   # do not perform function calls in argument defaults
-    "B904",   # Within an except clause, raise exceptions with `raise ... from err`
-    "ARG001", # Unused function argument
-    "ARG002", # Unused method argument
-    "ARG005", # Unused lambda argument
-    "SIM108", # Use ternary operator (less readable in many cases)
-]
-
-[tool.ruff.lint.isort]
-known-first-party = ["zorvex_api", "zorvex_cli"]
-
-[dependency-groups]
-dev = [
-    "ruff>=0.17.6",
-    "ty>=0.0.108,<0.1.0",
-    "bandit>=1.9.4",
-    "pre-commit>=4.7.0",
-]

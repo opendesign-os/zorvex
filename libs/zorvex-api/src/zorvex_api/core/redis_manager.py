@@ -14,6 +14,9 @@ from zorvex_api.settings import settings
 logger = structlog.get_logger(__name__)
 
 _DEFAULT_MAX_CONNECTIONS = 250
+# RESP2, which every Redis speaks: nothing here needs RESP3, and asking for it costs each new
+# connection a HELLO round trip, and a warning per connection on a server older than Redis 6.
+_PROTOCOL = 2
 # PING pooled connections idle longer than this (seconds) before reuse, so
 # server-side idle disconnects don't surface as ConnectionError.
 _DEFAULT_HEALTH_CHECK_INTERVAL = 30
@@ -46,6 +49,7 @@ class RedisManager:
         # query parameters of the same name override.
         self._pool = aioredis.ConnectionPool.from_url(
             url,
+            protocol=_PROTOCOL,
             max_connections=_DEFAULT_MAX_CONNECTIONS,
             decode_responses=True,
             health_check_interval=_DEFAULT_HEALTH_CHECK_INTERVAL,
@@ -61,6 +65,7 @@ class RedisManager:
         # a reply lost with the old connection, so errors surface and _dequeue polls Postgres.
         self._blocking_pool = aioredis.ConnectionPool.from_url(
             url,
+            protocol=_PROTOCOL,
             decode_responses=True,
             health_check_interval=_DEFAULT_HEALTH_CHECK_INTERVAL,
         )

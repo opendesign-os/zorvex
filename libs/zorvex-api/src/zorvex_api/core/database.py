@@ -1,6 +1,11 @@
-"""Database manager with LangGraph integration"""
+"""The database: a SQLAlchemy engine for Zorvex's tables, and the pool LangGraph's checkpointer and store share.
 
-from typing import Any, cast
+Both connect with psycopg, so libpq parses DATABASE_URI for each of them: multiple
+hosts, sslmode, sslrootcert, target_session_attrs and the PG* environment variables
+work as in libpq. Prepared statements are off, so PgBouncer in transaction mode works.
+"""
+
+from typing import cast
 
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -24,21 +29,8 @@ logger = structlog.get_logger(__name__)
 _STORE_TTL_DEFAULTS: TTLConfig = {"refresh_on_read": True, "omit_expired": True, "sweep_interval_minutes": 5}
 
 
-def create_db_engine(**kwargs: Any) -> AsyncEngine:
-    """A SQLAlchemy engine on asyncpg for DATABASE_URI.
-
-    The URL goes to asyncpg whole, as its DSN. Parsed by SQLAlchemy instead, every
-    query parameter would become a keyword argument asyncpg rejects (sslmode,
-    target_session_attrs, ...) and multiple hosts would need rewriting.
-    """
-    return create_async_engine(
-        "postgresql+asyncpg://",
-        connect_args={
-            "dsn": settings.db.DATABASE_URI,
-            "prepared_statement_cache_size": 0,  # PgBouncer compatibility
-        },
-        **kwargs,
-    )
+async def _connect() -> AsyncConnection:
+    return await AsyncConnection.connect(settings.db.DATABASE_URI, prepare_threshold=None)
 
 
 class DatabaseManager:
@@ -73,10 +65,9 @@ class DatabaseManager:
             logger.exception("Cleanup after failed database initialization also failed")
 
     async def _initialize_components(self) -> None:
-        # 1. SQLAlchemy Engine (app metadata, uses asyncpg)
-        # We strictly limit this pool because the main load
-        # is handled by LangGraph components.
-        self.engine = create_db_engine(
+        self.engine = create_async_engine(
+            "postgresql+psycopg://",
+            async_creator=_connect,
             pool_size=settings.pool.SQLALCHEMY_POOL_SIZE,
             max_overflow=settings.pool.SQLALCHEMY_MAX_OVERFLOW,
             pool_pre_ping=True,
@@ -84,11 +75,7 @@ class DatabaseManager:
         )
 
         lg_max = settings.pool.LANGGRAPH_POSTGRES_POOL_MAX_SIZE
-        lg_kwargs = {
-            "autocommit": True,
-            "prepare_threshold": None,  # Disable prepared statements for PgBouncer compatibility
-            "row_factory": dict_row,  # LangGraph requires dictionary rows, not tuples
-        }
+        lg_kwargs = {"autocommit": True, "prepare_threshold": None, "row_factory": dict_row}
 
         # Opened explicitly: a pool opened in its constructor warns.
         pool = Pool(

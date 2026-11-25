@@ -23,11 +23,11 @@ import structlog
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 
 from zorvex_api.core import loopback
-from zorvex_api.core.auth_middleware import get_auth_backend
+from zorvex_api.core.auth import require_auth
 from zorvex_api.core.authorization import Authorization
 from zorvex_api.core.orm import get_session_maker
 from zorvex_api.models import User
-from zorvex_api.services.event_streaming.commands import handle_command
+from zorvex_api.services.event_streaming.commands import INVALID_COMMAND, handle_command
 from zorvex_api.services.event_streaming.protocol import Response, build_error, build_success
 from zorvex_api.services.event_streaming.session import RunLister, ThreadEventSession, validate_channels
 from zorvex_api.services.ownership import owned_thread
@@ -39,17 +39,14 @@ _RECONNECT = "subscription.reconnect"
 _UNSUBSCRIBE = "subscription.unsubscribe"
 
 
-async def _user(websocket: WebSocket) -> User:
-    if loopback.is_loopback(websocket.scope):
-        return loopback.acting_user.get() or loopback.ANONYMOUS
-    return await get_auth_backend().authenticate(websocket)
-
-
 class _Socket:
-    def __init__(self, websocket: WebSocket, thread_id: str, user: User, lister: Callable[[User], RunLister]) -> None:
+    def __init__(
+        self, websocket: WebSocket, thread_id: str, authorize: Authorization, lister: Callable[[User], RunLister]
+    ) -> None:
         self.websocket = websocket
         self.thread_id = thread_id
-        self.user = user
+        self.authorize = authorize
+        self.user = authorize.user
         self.lister = lister
         self.subscriptions: dict[str, asyncio.Task[None]] = {}
         self.lock = asyncio.Lock()
@@ -109,15 +106,15 @@ class _Socket:
         command_id = body.get("id") if isinstance(body, dict) else None
         method = body.get("method") if isinstance(body, dict) else None
         if not isinstance(command_id, int) or isinstance(command_id, bool) or not isinstance(method, str):
-            return build_error(None, "invalid_argument", "Commands must include an integer id and string method."), None
+            return build_error(None, "invalid_argument", INVALID_COMMAND), None
         params = body.get("params") if isinstance(body.get("params"), dict) else {}
         if method in (_SUBSCRIBE, _RECONNECT):
             return self.subscribe(command_id, params, method), method
         if method == _UNSUBSCRIBE:
             return self.unsubscribe(command_id, params), method
         async with get_session_maker()() as session:
-            response, _ = await handle_command(
-                {**body, "params": params}, session=session, thread_id=self.thread_id, user=self.user
+            response = await handle_command(
+                {**body, "params": params}, session=session, thread_id=self.thread_id, authorize=self.authorize
             )
         return response, method
 
@@ -131,8 +128,10 @@ async def serve(websocket: WebSocket, thread_id: str, lister: Callable[[User], R
     """Serve one client's socket on *thread_id* until it goes."""
     await websocket.accept()
     try:
-        user = await _user(websocket)
-        filters = await Authorization(user, "threads", "read")({"thread_id": thread_id})
+        user = await require_auth(websocket)
+        # A graph's own socket is trusted, as its loopback requests are.
+        authorize = Authorization(user, "threads", "read", trusted=loopback.is_loopback(websocket.scope))
+        filters = await authorize({"thread_id": thread_id})
     except HTTPException as exc:
         await websocket.close(code=4000 + exc.status_code)
         return
@@ -146,7 +145,7 @@ async def serve(websocket: WebSocket, thread_id: str, lister: Callable[[User], R
                 return
             missing = True
 
-    socket = _Socket(websocket, thread_id, user, lister)
+    socket = _Socket(websocket, thread_id, authorize, lister)
     try:
         while True:
             text = await websocket.receive_text()

@@ -1,9 +1,9 @@
-"""A2A messages and LangGraph messages, each into the other, in the Agent Server's wire format.
+"""A2A tasks and messages, and LangGraph messages each into the other, in the Agent Server's wire format.
 
-The Agent Server answers in JSON of its own: A2A 1.0's enum names
-(``TASK_STATE_*``, ``ROLE_*``) with v0.3's ``kind`` discriminators and part
-shapes (``text``; ``file`` holding ``bytes`` or ``uri``; ``data``).
-``to_spec_format`` turns it into v0.3's for the v0.3 method names.
+The Agent Server answers A2A 1.0 in JSON of its own: 1.0's enum names
+(``TASK_STATE_*``, ``ROLE_*``) with ``kind`` discriminators (``task``,
+``message``, ``status-update``, ``artifact-update``) and its own part shapes
+(``text``; ``file`` holding ``bytes`` or ``uri``; ``data``).
 
 Inbound, a message's text parts become the graph's messages, or one message
 of content blocks when the message carries files or A2UI; its object data
@@ -20,7 +20,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 from uuid import uuid4
 
 import structlog
@@ -33,21 +33,17 @@ from zorvex_api.settings import settings
 logger = structlog.getLogger(__name__)
 
 Role = Literal["ROLE_USER", "ROLE_AGENT"]
+ROLES: frozenset[str] = frozenset(get_args(Role))
 HistoryScope = Literal["context", "task"]
 
-_ROLES_V03 = {"ROLE_USER": "user", "ROLE_AGENT": "agent"}
-_STATES_V03 = {
-    "TASK_STATE_SUBMITTED": "submitted",
-    "TASK_STATE_WORKING": "working",
-    "TASK_STATE_COMPLETED": "completed",
-    "TASK_STATE_FAILED": "failed",
-    "TASK_STATE_CANCELED": "canceled",
-    "TASK_STATE_INPUT_REQUIRED": "input-required",
-    "TASK_STATE_REJECTED": "rejected",
-    "TASK_STATE_AUTH_REQUIRED": "auth-required",
-}
-_ROLES_FROM_V03 = {v03: v1 for v1, v03 in _ROLES_V03.items()}
-STATES_FROM_V03 = {v03: v1 for v1, v03 in _STATES_V03.items()}
+SUBMITTED = "TASK_STATE_SUBMITTED"
+WORKING = "TASK_STATE_WORKING"
+COMPLETED = "TASK_STATE_COMPLETED"
+FAILED = "TASK_STATE_FAILED"
+CANCELED = "TASK_STATE_CANCELED"
+INPUT_REQUIRED = "TASK_STATE_INPUT_REQUIRED"
+REJECTED = "TASK_STATE_REJECTED"
+AUTH_REQUIRED = "TASK_STATE_AUTH_REQUIRED"
 
 _USER_TYPES = frozenset({"human", "humanmessage", "humanmessagechunk"})
 _AGENT_TYPES = frozenset({"ai", "aimessage", "aimessagechunk"})
@@ -61,29 +57,60 @@ class InvalidAgentResponseError(ValueError):
     """Agent output that no A2A part can carry: -32006."""
 
 
+# --- tasks
+
+
+@dataclass(frozen=True)
+class TaskRef:
+    """A task: its id, and its context, the thread its runs are on."""
+
+    task_id: str
+    context_id: str
+
+
+def task(ref: TaskRef, **fields: Any) -> dict[str, Any]:
+    """A task: its kind, id and context, then *fields* in the order given, those that are None left out."""
+    return {
+        "kind": "task",
+        "id": ref.task_id,
+        "contextId": ref.context_id,
+        **{name: value for name, value in fields.items() if value is not None},
+    }
+
+
+def status_update(ref: TaskRef, status: dict[str, Any], *, final: bool) -> dict[str, Any]:
+    """A status sent on the task's stream; the *final* one ends it."""
+    return {
+        "taskId": ref.task_id,
+        "contextId": ref.context_id,
+        "kind": "status-update",
+        "status": status,
+        "final": final,
+    }
+
+
+def artifact_update(ref: TaskRef, artifact: dict[str, Any], **flags: Any) -> dict[str, Any]:
+    """An artifact sent on the task's stream, *flags* (``append``, ``lastChunk``) after it."""
+    return {
+        "taskId": ref.task_id,
+        "contextId": ref.context_id,
+        "kind": "artifact-update",
+        "artifact": artifact,
+        **flags,
+    }
+
+
 # --- inbound
 
 
-def normalize_role(role: Any) -> Any:
-    """A message role as A2A 1.0 names it; v0.3's ``user`` and ``agent`` are accepted."""
-    return _ROLES_FROM_V03.get(role, role)
-
-
-def message_input(
-    parts: Sequence[Any],
-    role: Any,
-    message_id: str,
-    *,
-    a2ui_context: A2UIContext,
-    task_id: str | None = None,
-    task_start_id: str | None = None,
-) -> dict[str, Any]:
+def message_input(message: Mapping[str, Any], *, a2ui_context: A2UIContext, stamp: Mapping[str, str]) -> dict[str, Any]:
     """The run input a message makes: ``messages`` from its text, files and A2UI, and its data parts' keys.
 
     Text alone makes one message per text part; with a file or an A2UI part,
     one message of content blocks in part order. Each carries, under
-    ``additional_kwargs.a2a``, the task it belongs to (or the start of a new
-    one) and the message's metadata and the extensions the client named.
+    ``additional_kwargs.a2a``, the *stamp* naming its task (``task_id``, or
+    ``task_start_id`` for a new one), the message's metadata and the
+    extensions the client named.
 
     Raises:
         ValueError: For a part that is not text, a file or data, a data part that is not an
@@ -91,8 +118,9 @@ def message_input(
         A2UIValidationError: For A2UI the assistant does not take, or that does not validate.
     """
     a2ui.validate_client_metadata(a2ui_context.metadata)
+    parts, message_id = message.get("parts", []), message["messageId"]
     has_blocks = any(isinstance(part, dict) and ("file" in part or is_a2ui_part(part)) for part in parts)
-    langgraph_role = "human" if role == "ROLE_USER" else "assistant"
+    langgraph_role = "human" if message["role"] == "ROLE_USER" else "assistant"
     messages: list[dict[str, Any]] = []
     blocks: list[dict[str, Any]] = []
     data: dict[str, Any] = {}
@@ -133,18 +161,13 @@ def message_input(
 
     if has_blocks:
         messages.append({"role": langgraph_role, "content": blocks, "id": message_id})
-    if task_id or task_start_id or a2ui_context.metadata or a2ui_context.extensions:
-        stamp: dict[str, Any] = {}
-        if task_id:
-            stamp["task_id"] = task_id
-        if task_start_id:
-            stamp["task_start_id"] = task_start_id
-        if a2ui_context.metadata:
-            stamp["metadata"] = a2ui_context.metadata
-        if a2ui_context.extensions:
-            stamp["extensions"] = a2ui_context.extensions
-        for message in messages:
-            message["additional_kwargs"] = {"a2a": stamp}
+    stamped: dict[str, Any] = dict(stamp)
+    if a2ui_context.metadata:
+        stamped["metadata"] = a2ui_context.metadata
+    if a2ui_context.extensions:
+        stamped["extensions"] = a2ui_context.extensions
+    for converted in messages:
+        converted["additional_kwargs"] = {"a2a": stamped}
     if not messages and not data:
         raise ValueError("Message must contain at least one valid text, data, or file part")
 
@@ -348,14 +371,15 @@ def current_turn(messages: Sequence[Any]) -> list[Any]:
 
 
 def response_parts(
-    result: Mapping[str, Any], *, a2ui_context: A2UIContext, turn: Sequence[Any] | None = None
+    result: Mapping[str, Any], *, a2ui_context: A2UIContext, turn: Sequence[Any] | None
 ) -> list[dict[str, Any]]:
-    """The run's reply: the last agent message of the turn that says something, then the turn's tool UI.
+    """A finished run's reply: the last agent message of the *turn* that says something, then the turn's tool UI.
 
-    A result without messages is its text (as Python prints it), as on the Agent Server.
+    Without a *turn*, it is the messages after the last user message. A result
+    without messages is its text (as Python prints it), as on the Agent Server.
     """
     messages = result.get("messages")
-    if "__error__" in result or not isinstance(messages, list) or not messages:
+    if not isinstance(messages, list) or not messages:
         return [{"kind": "text", "text": str(result)}]
     turn = current_turn(messages) if turn is None else list(turn)
     tool_ui = [part for message in turn for part in tool_result_a2ui_parts(message, a2ui_context)]
@@ -368,18 +392,12 @@ def response_parts(
 
 
 def interrupt_artifact(interrupts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """The interrupts a run paused on, one data part each: id, value, and response schema when there is one."""
-    parts = []
-    for interrupt in interrupts:
-        data = {"id": interrupt.get("id"), "value": interrupt.get("value")}
-        if interrupt.get("response_schema") is not None:
-            data["response_schema"] = interrupt["response_schema"]
-        parts.append({"kind": "data", "data": data})
+    """The interrupts a run paused on, as the Agent Server shows them (``public_interrupt``), one data part each."""
     return {
         "artifactId": str(uuid4()),
         "name": "Interrupt",
         "description": "Agent requires input to continue",
-        "parts": parts,
+        "parts": [{"kind": "data", "data": dict(interrupt)} for interrupt in interrupts],
     }
 
 
@@ -389,30 +407,6 @@ def response_artifact(parts: list[dict[str, Any]], assistant_id: str) -> dict[st
         "name": "Assistant Response",
         "description": f"Response from assistant {assistant_id}",
         "parts": parts,
-    }
-
-
-def response_artifact_update(
-    *, task_id: str, context_id: str, parts: list[dict[str, Any]], assistant_id: str
-) -> dict[str, Any]:
-    return {
-        "taskId": task_id,
-        "contextId": context_id,
-        "kind": "artifact-update",
-        "artifact": response_artifact(parts, assistant_id),
-        "append": False,
-        "lastChunk": True,
-    }
-
-
-def interrupt_artifact_update(
-    *, task_id: str, context_id: str, interrupts: Sequence[Mapping[str, Any]]
-) -> dict[str, Any]:
-    return {
-        "taskId": task_id,
-        "contextId": context_id,
-        "kind": "artifact-update",
-        "artifact": interrupt_artifact(interrupts),
     }
 
 
@@ -461,7 +455,7 @@ def _tool_call_id(message: Mapping[str, Any]) -> str | None:
     return tool_call_id if isinstance(tool_call_id, str) and tool_call_id else None
 
 
-def working_update(items: Sequence[Any], *, task_id: str, context_id: str) -> dict[str, Any]:
+def working_update(items: Sequence[Any], ref: TaskRef) -> dict[str, Any]:
     """A WORKING status update carrying streamed messages: the public ones' text, then any tool results."""
     texts: list[str] = []
     results: list[dict[str, Any]] = []
@@ -484,16 +478,10 @@ def working_update(items: Sequence[Any], *, task_id: str, context_id: str) -> di
         "role": "ROLE_AGENT",
         "parts": parts or [{"kind": "text", "text": ""}],
         "messageId": str(uuid4()),
-        "taskId": task_id,
-        "contextId": context_id,
+        "taskId": ref.task_id,
+        "contextId": ref.context_id,
     }
-    return {
-        "taskId": task_id,
-        "contextId": context_id,
-        "kind": "status-update",
-        "status": {"state": "TASK_STATE_WORKING", "message": message, "timestamp": now_iso()},
-        "final": False,
-    }
+    return status_update(ref, {"state": WORKING, "message": message, "timestamp": now_iso()}, final=False)
 
 
 def agent_message(text: str, *, task_id: str, context_id: str | None = None) -> dict[str, Any]:
@@ -521,8 +509,8 @@ class View:
     task_ids: Mapping[str, str] | None = None
 
 
-def history(messages: Sequence[Any], task_id: str, context_id: str, view: View) -> list[dict[str, Any]]:
-    """The thread's public messages as A2A messages, each attributed to its task.
+def history(messages: Sequence[Any], ref: TaskRef, view: View) -> list[dict[str, Any]]:
+    """The thread's public messages as A2A messages, each attributed to its task, as *ref*'s request sees them.
 
     A message stamped with a task (or a task's start) begins that task's
     segment, which runs until the next stamp; one stamped with a task of
@@ -531,6 +519,7 @@ def history(messages: Sequence[Any], task_id: str, context_id: str, view: View) 
     only the requested task's messages are kept. Tool results are agent data
     parts; system prompts and tool output not answering a call are left out.
     """
+    task_id = ref.task_id
     history_a2ui = replace(view.a2ui, drop_invalid=True)
     current: str | None = None if view.scope == "task" else task_id
     known = set(view.task_ids.values()) if view.task_ids is not None else None
@@ -576,7 +565,7 @@ def history(messages: Sequence[Any], task_id: str, context_id: str, view: View) 
                 "parts": parts,
                 "messageId": message.get("id") or str(uuid7()),
                 "taskId": current,
-                "contextId": context_id,
+                "contextId": ref.context_id,
             }
         )
     if view.scope == "task":
@@ -631,25 +620,6 @@ class RunMessages:
         messages = list(self.messages)
         messages[self.added_from] = {**message, "additional_kwargs": {**kwargs, "a2a": {**stamp, "task_id": task_id}}}
         return messages
-
-
-def to_spec_format(data: Any) -> Any:
-    """A response in v0.3's spelling: lower-case roles and states, and a task no longer wrapped in ``task``."""
-    if isinstance(data, dict):
-        converted: dict[str, Any] = {}
-        for key, value in data.items():
-            if key == "role" and isinstance(value, str):
-                converted[key] = _ROLES_V03.get(value, value)
-            elif key == "state" and isinstance(value, str):
-                converted[key] = _STATES_V03.get(value, value)
-            elif key == "result" and isinstance(value, dict) and list(value) == ["task"]:
-                converted[key] = to_spec_format(value["task"])
-            else:
-                converted[key] = to_spec_format(value)
-        return converted
-    if isinstance(data, list):
-        return [to_spec_format(item) for item in data]
-    return data
 
 
 def now_iso() -> str:

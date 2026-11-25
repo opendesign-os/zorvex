@@ -28,8 +28,7 @@ from fastapi.routing import APIRoute
 from langgraph_sdk import Auth
 
 from zorvex_api.core import loopback
-from zorvex_api.core.auth_deps import require_auth
-from zorvex_api.core.auth_middleware import get_auth_instance
+from zorvex_api.core.auth import get_auth_instance, require_auth
 from zorvex_api.models.auth import User
 
 Resource = Literal["assistants", "threads", "crons", "store"]
@@ -49,6 +48,10 @@ class Authorization:
         # A loopback request's: allowed without running a handler, as on the Agent Server.
         self.trusted = trusted
         self.dispatched = False
+
+    def to(self, resource: Resource, action: Action) -> Authorization:
+        """The same caller's attempt at another event, as an operation touching several resources makes."""
+        return Authorization(self.user, resource, action, trusted=self.trusted)
 
     async def __call__(self, value: dict[str, Any]) -> Filters | None:
         """Run the event's handler on *value*; returns the filter it set, or None.
@@ -123,8 +126,7 @@ def _api_routes(routes: Iterable[Any]) -> Iterator[APIRoute]:
         if isinstance(route, APIRoute):
             yield route
             continue
-        # FastAPI wraps included routers; newer versions expose the wrapped
-        # router as `original_router` rather than `routes`.
+        # FastAPI keeps an included router whole, as the wrapper's `original_router`; a mount has `routes`.
         nested = getattr(route, "original_router", None)
         if nested is not None:
             yield from _api_routes(nested.routes)

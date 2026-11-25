@@ -1,4 +1,9 @@
-"""Authentication: the ``@auth.authenticate`` handler of zorvex.json ``auth.path``, run for each request."""
+"""Authentication: the ``@auth.authenticate`` handler of zorvex.json ``auth.path``, once per request.
+
+``require_auth`` is the routes' dependency. Without ``auth.path`` every request is
+the one anonymous user; a loopback request (core/loopback.py) is not
+authenticated, and acts as the user its graph acts for.
+"""
 
 import functools
 import inspect
@@ -6,7 +11,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import structlog
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from langgraph_sdk import Auth
 from starlette.requests import HTTPConnection
 
@@ -30,6 +35,9 @@ _REQUEST_PARTS: dict[str, Callable[[HTTPConnection], Any]] = {
 
 _USER_ATTRIBUTES = ("identity", "display_name", "permissions", "is_authenticated")
 
+# Several dependencies of one request can ask for its user; the handler runs once, as a credential may be single-use.
+_SCOPE_KEY = "zorvex.auth_result"
+
 
 class AuthBackend:
     """Authenticates requests with the ``@auth.authenticate`` handler of ``auth.path``."""
@@ -49,7 +57,6 @@ class AuthBackend:
     async def authenticate(self, request: HTTPConnection) -> User:
         """The request's user. Raises HTTPException when authentication fails."""
         if self.auth_instance is None:
-            # Every caller shares this identity: no tenant isolation (warned once at startup).
             return loopback.ANONYMOUS
         if self._handler is None:
             raise HTTPException(401, "Authentication required")
@@ -90,19 +97,33 @@ def _user(result: Any) -> User:
         data = {key: getattr(result, key) for key in _USER_ATTRIBUTES if hasattr(result, key)}
     if not data.get("identity"):
         raise TypeError("@auth.authenticate must return a user id, or a mapping or object with an identity")
-    data["display_name"] = data.get("display_name") or data["identity"]
+    if not data.get("display_name"):
+        data.pop("display_name", None)
     return User.model_validate(data)
 
 
 @functools.lru_cache(maxsize=1)
 def get_auth_backend() -> AuthBackend:
-    """The authentication backend, built once on first use.
-
-    zorvex.json ``auth.path`` alone decides whether requests are authenticated.
-    """
+    """The authentication backend, built once on first use."""
     return AuthBackend()
 
 
 def get_auth_instance() -> Auth | None:
     """The loaded Auth instance, or None when no auth.path is configured."""
     return get_auth_backend().auth_instance
+
+
+async def require_auth(connection: HTTPConnection) -> User:
+    """The request's (or socket's) user, authenticated once per connection."""
+    user = connection.scope.get(_SCOPE_KEY)
+    if user is None:
+        if loopback.is_loopback(connection.scope):
+            user = loopback.acting_user.get() or loopback.ANONYMOUS
+        else:
+            user = await get_auth_backend().authenticate(connection)
+        connection.scope[_SCOPE_KEY] = user
+    return user
+
+
+# For a whole router.
+auth_dependency = [Depends(require_auth)]

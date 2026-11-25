@@ -16,10 +16,8 @@ import socket
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import cast
-from uuid import UUID
 
 import structlog
-from pydantic import ValidationError
 from redis import RedisError
 from sqlalchemy import select, update
 
@@ -50,15 +48,6 @@ logger = structlog.getLogger(__name__)
 
 # How often a wait re-checks a run that may have ended without a done message.
 _DONE_RECHECK_SECONDS = 5.0
-
-
-def _is_valid_run_id(value: str) -> bool:
-    """Whether a queue entry is a run id (a UUID), not garbage pushed onto the queue."""
-    try:
-        UUID(value)
-    except ValueError:
-        return False
-    return True
 
 
 async def _cleanup_cancelled_execution(run_id: str, execution_task: asyncio.Task[None]) -> None:
@@ -117,10 +106,9 @@ class WorkerExecutor(BaseExecutor):
     async def submit(self, job: RunJob) -> None:
         run_id = job.identity.run_id
         entry = {run_id: job_queue.score(job.priority, job.identity.created_at)}
-        delay = (job.identity.created_at - datetime.now(UTC)).total_seconds()
-        if delay > 0:
+        if job.identity.created_at > datetime.now(UTC):
             # Queued once due. Should this process stop first, the lease reaper finds the run pending.
-            task = asyncio.create_task(_enqueue_when_due(entry, delay))
+            task = asyncio.create_task(_enqueue_when_due(entry, job.identity.created_at))
             _delayed_enqueues.add(task)
             task.add_done_callback(_delayed_enqueues.discard)
             return
@@ -164,10 +152,6 @@ class WorkerExecutor(BaseExecutor):
     async def start(self) -> None:
         self._running = True
         count = settings.worker.WORKER_COUNT
-        if count == 0:
-            logger.warning(
-                "WORKER_COUNT=0: no workers on this instance, runs will queue until another instance picks them up"
-            )
         for idx in range(count):
             name = f"{self._instance_id}-worker-{idx}"
             task = asyncio.create_task(self._worker_loop(name))
@@ -249,11 +233,6 @@ class WorkerExecutor(BaseExecutor):
                     semaphore.release()
                     continue
                 run_id, score = head
-
-                if not _is_valid_run_id(run_id):
-                    logger.warning("Invalid run_id dequeued, discarding", value=run_id[:64])
-                    semaphore.release()
-                    continue
 
                 if not self._running:
                     # Dequeued while shutdown was already underway: hand it back
@@ -441,17 +420,12 @@ async def _get_run_identity(run_id: str) -> tuple[str, str] | None:
 
 
 # ------------------------------------------------------------------
-# Lease operations (module-level for reuse by LeaseReaper)
+# Leases
 # ------------------------------------------------------------------
 
 
 async def _acquire_and_load(run_id: str, worker_name: str) -> RunJob | None:
-    """Acquire lease and load job in a single DB session.
-
-    The lease UPDATE returns the claimed row, so the job is read in the same
-    statement. A row whose execution_params cannot be rebuilt into a job is
-    marked errored.
-    """
+    """Claim the run's lease and read its job, in one statement: the UPDATE returns the claimed row."""
     now = datetime.now(UTC)
     lease_until = now + timedelta(seconds=settings.worker.LEASE_DURATION_SECONDS)
     maker = get_session_maker()
@@ -470,24 +444,7 @@ async def _acquire_and_load(run_id: str, worker_name: str) -> RunJob | None:
             await session.rollback()
             return None
         await session.commit()
-
-        try:
-            job = RunJob.from_run_orm(run_orm)
-        except (KeyError, ValidationError):
-            logger.warning("Run's execution_params do not describe a job, failing it", run_id=run_id)
-            await session.execute(
-                update(RunORM)
-                .where(RunORM.run_id == run_id, RunORM.claimed_by == worker_name)
-                .values(
-                    claimed_by=None,
-                    lease_expires_at=None,
-                    status="error",
-                    error={"error": "Error", "message": "Run's execution_params do not describe a job"},
-                )
-            )
-            await session.commit()
-            return None
-        return job
+        return RunJob.from_run_orm(run_orm)
 
 
 async def _push_back(entries: Mapping[str, float]) -> None:
@@ -503,8 +460,14 @@ async def _push_back(entries: Mapping[str, float]) -> None:
 _delayed_enqueues: set[asyncio.Task[None]] = set()
 
 
-async def _enqueue_when_due(entries: Mapping[str, float], delay: float) -> None:
-    await asyncio.sleep(delay)
+async def _enqueue_when_due(entries: Mapping[str, float], due: datetime) -> None:
+    """Queue the runs once *due* has passed by the wall clock, which their claim checks.
+
+    asyncio may fire a timer up to a clock tick early (some 15ms on Windows): a run queued
+    before it is due fails its claim and leaves the queue, stranded until the reaper.
+    """
+    while (remaining := (due - datetime.now(UTC)).total_seconds()) > 0:
+        await asyncio.sleep(remaining)
     await _push_back(entries)
 
 
@@ -532,18 +495,9 @@ async def _requeue_drained_runs(run_ids: list[str]) -> None:
         )
         reset = {row.run_id: job_queue.score(row.priority, row.created_at) for row in result.fetchall()}
         await session.commit()
-    reset_ids = list(reset)
-
-    if not reset_ids:
-        return
-
-    logger.info("Requeueing drained runs for another instance", count=len(reset_ids), run_ids=reset_ids)
-    try:
-        await job_queue.push(reset)
-    except RedisError:
-        # Rows are already pending + unclaimed: the stuck-pending reaper or the
-        # Postgres poll fallback on a surviving instance picks them up.
-        logger.warning("Redis unavailable during drain requeue, reaper will recover", run_ids=reset_ids)
+    if reset:
+        logger.info("Requeueing drained runs for another instance", count=len(reset), run_ids=list(reset))
+        await _push_back(reset)
 
 
 async def _release_lease(run_id: str, worker_name: str) -> None:
@@ -558,17 +512,8 @@ async def _release_lease(run_id: str, worker_name: str) -> None:
         await session.commit()
 
 
-async def _heartbeat_loop(
-    run_id: str,
-    worker_name: str,
-    *,
-    job_task: asyncio.Task[None] | None = None,
-) -> None:
-    """Extend lease periodically while the job is running.
-
-    If the lease is lost (another worker claimed the run), cancels
-    ``job_task`` to prevent double execution.
-    """
+async def _heartbeat_loop(run_id: str, worker_name: str, job_task: asyncio.Task[None]) -> None:
+    """Extend the lease while the job runs; a lease another worker took cancels *job_task*, so it runs once."""
     interval = settings.worker.heartbeat_interval_seconds
     duration = settings.worker.LEASE_DURATION_SECONDS
     maker = get_session_maker()
@@ -591,7 +536,7 @@ async def _heartbeat_loop(
                     run_id=run_id,
                     worker=worker_name,
                 )
-                if job_task is not None and not job_task.done():
+                if not job_task.done():
                     _lease_loss_cancellations.add(run_id)
                     job_task.cancel()
                 return
@@ -611,10 +556,7 @@ async def _is_done(manager: RedisBrokerManager, run_id: str) -> bool:
 
 
 async def _is_run_terminal(run_id: str) -> bool:
-    """Check if a run has reached a terminal state in the DB."""
-    maker = get_session_maker()
-    async with maker() as session:
-        run_orm = await session.scalar(select(RunORM).where(RunORM.run_id == run_id))
-        if run_orm is None:
-            return True
-        return run_orm.status in TERMINAL_RUN_STATUSES
+    """Whether the run has ended, or is gone."""
+    async with get_session_maker()() as session:
+        status = await session.scalar(select(RunORM.status).where(RunORM.run_id == run_id))
+    return status is None or status in TERMINAL_RUN_STATUSES

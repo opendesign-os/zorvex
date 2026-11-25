@@ -6,13 +6,12 @@ factory is called on every access, as the Agent Server calls it, with the
 config the caller passes and a ServerRuntime for the access.
 """
 
-import sys
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
-from uuid import uuid5
+from uuid import UUID, uuid5
 
 import structlog
 from fastapi import HTTPException
@@ -22,12 +21,12 @@ from langgraph.pregel import Pregel
 from langgraph_sdk.runtime import AccessContext
 from sqlalchemy import func, select
 
-from zorvex_api.config import GraphEntry, config_dir, load_config
-from zorvex_api.constants import ASSISTANT_NAMESPACE_UUID
+from zorvex_api.config import GraphEntry, load_config
 from zorvex_api.core import loopback
 from zorvex_api.core.database import db_manager
 from zorvex_api.core.orm import Assistant as AssistantORM
 from zorvex_api.core.orm import AssistantVersion as AssistantVersionORM
+from zorvex_api.core.orm import Thread as ThreadORM
 from zorvex_api.core.orm import get_session_maker
 from zorvex_api.models.auth import User
 from zorvex_api.models.run_job import RunJob
@@ -39,6 +38,10 @@ logger = structlog.get_logger(__name__)
 
 # The name LangGraph gives a compiled graph nobody named; the server names it after its graph id.
 _UNNAMED_GRAPH = "LangGraph"
+# What a graph's system assistant id derives from; changing it orphans every system assistant.
+_SYSTEM_ASSISTANT_NAMESPACE = UUID("6ba7b821-9dad-11d1-80b4-00c04fd430c8")
+# The owner of the system assistants, which every user can read (services/ownership.py).
+SYSTEM_OWNER = "system"
 
 
 def _module_name_for(graph_id: str) -> str:
@@ -80,8 +83,6 @@ class LangGraphService:
     async def initialize(self) -> None:
         """Load the graphs, then give each its system assistant."""
         config = load_config()
-        # Dependency paths go on sys.path before the graph modules import.
-        _add_dependency_paths(config.dependencies)
         entries = {
             graph_id: entry if isinstance(entry, GraphEntry) else GraphEntry(path=entry)
             for graph_id, entry in config.graphs.items()
@@ -97,6 +98,15 @@ class LangGraphService:
     def list_graphs(self) -> dict[str, str]:
         """The graph ids zorvex.json declares, with the path each loads from."""
         return {graph_id: entry.path for graph_id, entry in self._entries.items()}
+
+    def require_graph(self, graph_id: str) -> None:
+        """404 unless zorvex.json declares *graph_id*."""
+        if graph_id not in self._entries:
+            raise HTTPException(404, f"Graph '{graph_id}' not found. Expected one of: {sorted(self._entries)}")
+
+    def assistant_id(self, requested: str) -> str:
+        """The assistant a client names: a graph id names its system assistant, anything else is an assistant id."""
+        return str(uuid5(_SYSTEM_ASSISTANT_NAMESPACE, requested)) if requested in self._entries else requested
 
     @asynccontextmanager
     async def get_graph(
@@ -142,6 +152,32 @@ class LangGraphService:
         finally:
             loopback.acting_user.reset(acting)
 
+    @asynccontextmanager
+    async def thread_graph(
+        self,
+        thread: ThreadORM,
+        user: User | None,
+        *,
+        access_context: AccessContext,
+        configurable: Mapping[str, Any] | None = None,
+    ) -> AsyncGenerator[tuple[Pregel, RunnableConfig] | None]:
+        """The graph a thread's state is read or written with, and the config it is bound to.
+
+        None while no run has bound a graph to the thread. The graph is built
+        from the thread's config (see :func:`thread_graph_config`), and
+        *configurable* (a checkpoint, say) goes on top of the thread's ids.
+        """
+        graph_id = thread.metadata_dict.get("graph_id")
+        if not graph_id:
+            yield None
+            return
+        config = create_thread_config(thread.thread_id, user)
+        config["configurable"].update(configurable or {})
+        async with self.get_graph(
+            graph_id, thread_graph_config(thread.config, config), access_context=access_context, user=user
+        ) as graph:
+            yield graph.with_config(config), config
+
     async def _ensure_system_assistants(self) -> None:
         """Give each graph a system assistant whose id derives from the graph id, so clients can pass the graph id.
 
@@ -150,7 +186,7 @@ class LangGraphService:
         """
         async with get_session_maker()() as session:
             for graph_id, entry in self._entries.items():
-                assistant_id = str(uuid5(ASSISTANT_NAMESPACE_UUID, graph_id))
+                assistant_id = self.assistant_id(graph_id)
                 graph = self._graphs[graph_id]
                 name = graph.name if isinstance(graph, Pregel) and graph.name != _UNNAMED_GRAPH else graph_id
                 description = entry.description
@@ -165,8 +201,8 @@ class LangGraphService:
                             description=description,
                             graph_id=graph_id,
                             config={},
-                            user_id="system",
-                            metadata_dict={"created_by": "system"},
+                            user_id=SYSTEM_OWNER,
+                            metadata_dict={"created_by": SYSTEM_OWNER},
                         )
                     )
                     session.add(
@@ -177,12 +213,11 @@ class LangGraphService:
                             description=description,
                             graph_id=graph_id,
                             config={},
-                            context={},
-                            metadata_dict={"created_by": "system"},
+                            metadata_dict={"created_by": SYSTEM_OWNER},
                         )
                     )
                     continue
-                if assistant.user_id != "system" or (assistant.name, assistant.description) == (name, description):
+                if assistant.user_id != SYSTEM_OWNER or (assistant.name, assistant.description) == (name, description):
                     continue
                 latest = await session.scalar(
                     select(func.max(AssistantVersionORM.version)).where(
@@ -199,7 +234,6 @@ class LangGraphService:
                         description=description,
                         graph_id=assistant.graph_id,
                         config=assistant.config,
-                        context=assistant.context,
                         metadata_dict=assistant.metadata_dict,
                         created_at=now,
                     )
@@ -207,20 +241,6 @@ class LangGraphService:
                 assistant.name, assistant.description = name, description
                 assistant.version, assistant.updated_at = version, now
             await session.commit()
-
-
-def _add_dependency_paths(dependencies: list[str]) -> None:
-    """Put zorvex.json's dependency directories on sys.path, the first listed first.
-
-    Relative paths resolve against the config file's directory.
-    """
-    for dependency in reversed(dependencies):
-        path = (config_dir() / dependency).resolve()
-        if not path.exists():
-            logger.warning("Dependency path does not exist", path=str(path))
-        elif str(path) not in sys.path:
-            sys.path.insert(0, str(path))
-            logger.info("Added dependency path to sys.path", path=str(path))
 
 
 _langgraph_service: LangGraphService | None = None

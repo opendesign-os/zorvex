@@ -12,8 +12,6 @@ The sweep never cancels runs: threads with pending/running runs are skipped
 and picked up on a later tick once their runs settle.
 """
 
-import asyncio
-import contextlib
 from collections.abc import Collection, Sequence
 from datetime import UTC, datetime, timedelta
 
@@ -30,6 +28,7 @@ from zorvex_api.core.orm import ThreadTTL as ThreadTTLORM
 from zorvex_api.core.orm import get_session_maker
 from zorvex_api.models.enums import ACTIVE_RUN_STATUSES, PruneStrategy
 from zorvex_api.observability.metrics import THREAD_TTL_SWEPT
+from zorvex_api.services.periodic import PeriodicTask
 
 logger = structlog.getLogger(__name__)
 
@@ -165,7 +164,7 @@ async def prune_threads_by_id(
     thread_ids: Sequence[str],
     strategy: PruneStrategy,
     user_id: str,
-    auth_filter: ColumnElement[bool] | None = None,
+    auth_filter: ColumnElement[bool],
 ) -> int:
     """Apply a prune strategy to the caller's named threads now; return how many were pruned.
 
@@ -177,10 +176,8 @@ async def prune_threads_by_id(
         .exists()
     )
     stmt = select(ThreadORM.thread_id).where(
-        ThreadORM.thread_id.in_(thread_ids), ThreadORM.user_id == user_id, ~active_runs_exist
+        ThreadORM.thread_id.in_(thread_ids), ThreadORM.user_id == user_id, ~active_runs_exist, auth_filter
     )
-    if auth_filter is not None:
-        stmt = stmt.where(auth_filter)
     # SKIP LOCKED: a thread mid run-creation holds a key-share lock; waiting on it would
     # recheck active runs against a stale snapshot and cascade-delete the new run.
     owned = list((await session.scalars(stmt.with_for_update(skip_locked=True, of=ThreadORM))).all())
@@ -198,53 +195,15 @@ async def prune_threads_by_id(
     return pruned
 
 
-class ThreadTTLSweeper:
-    """Periodically deletes or compacts expired threads."""
+class ThreadTTLSweeper(PeriodicTask):
+    """Deletes or compacts expired threads."""
 
-    def __init__(self) -> None:
-        """Initialize the sweeper state for the background polling loop."""
-        self._task: asyncio.Task[None] | None = None
-        self._running = False
+    name = "thread TTL sweeper"
 
-    async def start(self) -> None:
-        """Start the background sweep task."""
-        self._running = True
-        self._task = asyncio.create_task(self._loop())
-        config = _sweep_config()
-        logger.info(
-            "Thread TTL sweeper started", interval_minutes=config.sweep_interval_minutes, sweep_limit=config.sweep_limit
-        )
+    def interval(self) -> float:
+        return _sweep_config().sweep_interval_minutes * 60
 
-    async def stop(self) -> None:
-        """Stop the background sweep task and wait for cancellation to finish."""
-        self._running = False
-        if self._task is not None:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
-        logger.info("Thread TTL sweeper stopped")
-
-    async def _loop(self) -> None:
-        """Tick then sleep so overdue threads are swept right after startup.
-
-        The sleep sits in its own try so a persistent _tick failure (DB down)
-        cannot spin the loop at CPU speed.
-        """
-        interval_seconds = _sweep_config().sweep_interval_minutes * 60
-        while self._running:
-            try:
-                await self._tick()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("Error in thread TTL sweep tick")
-            try:
-                await asyncio.sleep(interval_seconds)
-            except asyncio.CancelledError:
-                break
-
-    async def _tick(self) -> None:
+    async def tick(self) -> None:
         """Sweep up to sweep_limit expired threads in sub-batched transactions."""
         config = _sweep_config()
         maker = get_session_maker()

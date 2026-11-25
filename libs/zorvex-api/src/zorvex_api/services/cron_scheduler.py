@@ -1,31 +1,24 @@
-"""Background scheduler that fires due cron jobs.
+"""Firing crons: claim the enabled crons whose next time has passed, start a run for each, move each on.
 
-Wakes up every ``CRON_SCHEDULER_SLEEP_TIME`` seconds (default 5), or at once
-after a full batch, claims any enabled crons whose ``next_run_date`` has
-passed, and triggers a run for each one via the existing run-preparation
-pipeline. Once a run is created
-the cron is advanced to its next occurrence (or disabled when ``end_time``
-has passed). The claim window itself is governed by
-``CRON_CLAIM_DURATION_SECONDS`` so a slow ``_fire_cron`` cannot race the
-next tick.
-
-Follows the same ``start()/stop()`` lifecycle pattern used by
-:class:`zorvex_api.services.lease_reaper.LeaseReaper`.
+A claim holds a cron for CRON_CLAIM_DURATION_SECONDS (``claimed_until``), so
+instances polling together fire it once and a slow firing does not race the
+next tick. Firing is at least once: an instance that dies between starting the
+run and moving the cron on leaves the claim to expire, and the cron fires again.
 """
 
-import asyncio
 import contextlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from fastapi import HTTPException
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from zorvex_api.core.orm import Cron as CronORM
 from zorvex_api.core.orm import get_session_maker
 from zorvex_api.models import Run, RunCreate, User
-from zorvex_api.services.cron_service import CronService
+from zorvex_api.services.cron_service import next_run_date
+from zorvex_api.services.periodic import PeriodicTask
 from zorvex_api.services.run_cleanup import delete_thread_after_run
 from zorvex_api.services.run_preparation import Launch, prepare_run, prepare_stateless_run
 from zorvex_api.settings import settings
@@ -33,173 +26,113 @@ from zorvex_api.settings import settings
 logger = structlog.getLogger(__name__)
 
 
-def _build_run_create(cron: CronORM) -> RunCreate:
-    """Build a ``RunCreate`` from the cron's stored payload."""
-    # The cron's own metadata is for searching crons; its runs do not carry it.
-    return RunCreate(assistant_id=cron.assistant_id, **(cron.payload or {}))
-
-
 async def start_cron_run(session: AsyncSession, cron: CronORM, user: User) -> Run:
     """Create one run from the cron's payload, on the cron's thread or on a new one.
 
     Saving the cron authorized its runs, so they are not authorized again. A new
-    thread is deleted once the run has finished, unless the cron keeps it.
+    thread is deleted once the run has finished, unless the cron keeps it. The
+    cron's own metadata is for searching crons; its runs do not carry it.
     """
-    request = _build_run_create(cron)
     launch = Launch(cron_id=cron.cron_id)
+    fields = {"assistant_id": cron.assistant_id, **cron.payload}
     if cron.thread_id is not None:
-        return await prepare_run(session, cron.thread_id, request, user, authorize=None, launch=launch)
+        return await prepare_run(
+            session, cron.thread_id, RunCreate.model_validate(fields), user, authorize=None, launch=launch
+        )
+    request = RunCreate.model_validate({**fields, "on_completion": cron.on_run_completed or "delete"})
     run = await prepare_stateless_run(session, request, user, authorize=None, launch=launch)
-    if cron.on_run_completed != "keep":
+    if request.on_completion != "keep":
         delete_thread_after_run(run, user.identity)
     return run
 
 
-async def _validate_cron_user(user_id: str) -> bool:
-    """Liveness check called before constructing a forged ``User`` for a fire.
+async def _claim_due(now: datetime) -> list[CronORM]:
+    """Claim the enabled crons whose next time has passed and that nobody holds, the most overdue first.
 
-    Default implementation accepts any non-empty user id. Operators that
-    integrate a real identity store can monkey-patch this symbol to
-    deactivate or revoke firing for users that no longer exist. Returning
-    False from this hook causes the scheduler to log a warning, disable the
-    cron, and skip the firing.
+    SKIP LOCKED gives instances polling together disjoint claims. At most
+    CRON_SCHEDULER_BATCH_SIZE crons when that is positive.
     """
-    return bool(user_id)
-
-
-class CronScheduler:
-    """Periodically fires due cron jobs by creating runs."""
-
-    def __init__(self) -> None:
-        """Initialize the scheduler state for the background polling loop."""
-        self._task: asyncio.Task[None] | None = None
-        self._running = False
-
-    async def start(self) -> None:
-        """Start the background polling task if the scheduler is enabled."""
-        self._running = True
-        self._task = asyncio.create_task(self._loop())
-        logger.info(
-            "Cron scheduler started",
-            interval_seconds=settings.cron.CRON_SCHEDULER_SLEEP_TIME,
-            claim_seconds=settings.cron.CRON_CLAIM_DURATION_SECONDS,
+    batch = settings.cron.CRON_SCHEDULER_BATCH_SIZE
+    async with get_session_maker()() as session:
+        due = await session.scalars(
+            select(CronORM.cron_id)
+            .where(
+                CronORM.enabled.is_(True),
+                CronORM.next_run_date <= now,
+                CronORM.claimed_until.is_(None) | (CronORM.claimed_until <= now),
+            )
+            .order_by(CronORM.next_run_date.asc())
+            .limit(batch if batch > 0 else None)
+            .with_for_update(skip_locked=True)
         )
+        cron_ids = list(due.all())
+        claimed: list[CronORM] = []
+        if cron_ids:
+            claimed = list(
+                await session.scalars(
+                    update(CronORM)
+                    .where(CronORM.cron_id.in_(cron_ids))
+                    .values(claimed_until=now + timedelta(seconds=settings.cron.CRON_CLAIM_DURATION_SECONDS))
+                    .returning(CronORM)
+                )
+            )
+        await session.commit()
+        return claimed
 
-    async def stop(self) -> None:
-        """Stop the background polling task and wait for cancellation to finish."""
-        self._running = False
-        if self._task is not None:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
-        logger.info("Cron scheduler stopped")
 
-    async def _loop(self) -> None:
-        """Tick, then sleep unless the tick claimed a full batch, as the Agent Server's scheduler does.
+async def _advance(session: AsyncSession, cron: CronORM) -> None:
+    """Move the cron to its next time and release its claim; past its end time, disable it instead."""
+    now = datetime.now(UTC)
+    if cron.end_time and now >= cron.end_time:
+        values: dict[str, object] = {"enabled": False, "updated_at": now}
+    else:
+        values = {"next_run_date": next_run_date(cron.schedule, cron.timezone, now)}
+    await session.execute(update(CronORM).where(CronORM.cron_id == cron.cron_id).values(claimed_until=None, **values))
+    await session.commit()
 
-        Ticking first claims the crons that fell due while the server was down
-        without waiting a poll; a failing tick still sleeps, so a database
-        outage cannot spin the loop.
-        """
-        batch = settings.cron.CRON_SCHEDULER_BATCH_SIZE
-        while self._running:
-            claimed = 0
-            try:
-                claimed = await self._tick()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("Error in cron scheduler tick")
-            if 0 < batch <= claimed:
-                continue
-            try:
-                await asyncio.sleep(settings.cron.CRON_SCHEDULER_SLEEP_TIME)
-            except asyncio.CancelledError:
-                break
 
-    async def _tick(self) -> int:
-        """Fire a run for each due cron it claims, and tell how many it claimed.
+async def _fire(session: AsyncSession, cron: CronORM) -> None:
+    """Start the cron's run and move the cron on; a run that cannot start leaves the cron to the next tick."""
+    user = User(identity=cron.user_id, display_name="cron-scheduler")
+    try:
+        run = await start_cron_run(session, cron, user)
+    except HTTPException as exc:
+        logger.error("Cron run creation failed", cron_id=cron.cron_id, status_code=exc.status_code, detail=exc.detail)
+    except Exception:
+        logger.exception("Cron run creation failed unexpectedly", cron_id=cron.cron_id)
+    else:
+        logger.info("Cron fired run", cron_id=cron.cron_id, run_id=run.run_id, thread_id=run.thread_id)
+        await _advance(session, cron)
+        return
+    # The claim goes and next_run_date stays, so the next tick tries again.
+    await session.rollback()
+    await session.execute(update(CronORM).where(CronORM.cron_id == cron.cron_id).values(claimed_until=None))
+    await session.commit()
 
-        Each cron runs in its own session so a SQL failure on one cron
-        cannot put the shared transaction into ``InFailedSqlTransaction`` and
-        silently kill the rest of the batch.
-        """
-        now = datetime.now(UTC)
-        maker = get_session_maker()
 
-        async with maker() as claim_session:
-            due_crons = await self._find_due_crons(claim_session, now)
+class CronScheduler(PeriodicTask):
+    """Fires due crons every CRON_SCHEDULER_SLEEP_TIME seconds, and at once after a full batch."""
 
-        if not due_crons:
-            logger.debug("Cron tick: no jobs due")
-            return 0
+    name = "cron scheduler"
 
-        logger.info("Cron tick: found due jobs", count=len(due_crons))
+    def interval(self) -> float:
+        return settings.cron.CRON_SCHEDULER_SLEEP_TIME
 
-        for cron in due_crons:
-            async with maker() as cron_session:
+    async def tick(self) -> bool:
+        due = await _claim_due(datetime.now(UTC))
+        if due:
+            logger.info("Firing due crons", count=len(due))
+        for cron in due:
+            # A session each, so one cron's failed SQL cannot abort the others' transaction.
+            async with get_session_maker()() as session:
                 try:
-                    await self._fire_cron(cron_session, cron)
+                    await _fire(session, cron)
                 except Exception:
                     logger.exception("Failed to fire cron job", cron_id=cron.cron_id)
                     with contextlib.suppress(Exception):
-                        await cron_session.rollback()
-        return len(due_crons)
-
-    @staticmethod
-    async def _find_due_crons(session: AsyncSession, now: datetime) -> list[CronORM]:
-        """Return enabled crons whose next_run_date has passed."""
-        return await CronService(session).get_due_crons(now)
-
-    @staticmethod
-    async def _fire_cron(session: AsyncSession, cron: CronORM) -> None:
-        """Create a run from the cron's payload and advance next_run_date."""
-        now = datetime.now(UTC)
-
-        # Liveness check: refuse to forge a User for a deleted/revoked identity.
-        if not await _validate_cron_user(cron.user_id):
-            logger.warning(
-                "Disabling cron because the owning user failed liveness check",
-                cron_id=cron.cron_id,
-                user_id=cron.user_id,
-            )
-            await session.execute(
-                update(CronORM)
-                .where(CronORM.cron_id == cron.cron_id)
-                .values(enabled=False, claimed_until=None, updated_at=now)
-            )
-            await session.commit()
-            return
-
-        user = User(
-            identity=cron.user_id,
-            display_name="cron-scheduler",
-            is_authenticated=True,
-        )
-        try:
-            run = await start_cron_run(session, cron, user)
-        except HTTPException as exc:
-            logger.error(
-                "Cron run creation failed",
-                cron_id=cron.cron_id,
-                status_code=exc.status_code,
-                detail=exc.detail,
-            )
-        except Exception:
-            logger.exception("Cron run creation failed unexpectedly", cron_id=cron.cron_id)
-        else:
-            logger.info("Cron fired run", cron_id=cron.cron_id, run_id=run.run_id, thread_id=run.thread_id)
-            # Delegate advance/disable to CronService so the rule lives in one place.
-            await CronService(session).advance_next_run(cron)
-            return
-
-        # Run setup failed: release the claim so the next tick retries, but
-        # leave next_run_date unchanged.
-        await session.rollback()
-        await session.execute(update(CronORM).where(CronORM.cron_id == cron.cron_id).values(claimed_until=None))
-        await session.commit()
+                        await session.rollback()
+        batch = settings.cron.CRON_SCHEDULER_BATCH_SIZE
+        return 0 < batch <= len(due)
 
 
-# Module-level singleton (matches executor / lease_reaper pattern)
 cron_scheduler = CronScheduler()

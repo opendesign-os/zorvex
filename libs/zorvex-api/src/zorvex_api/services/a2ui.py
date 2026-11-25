@@ -2,12 +2,14 @@
 
 A2UI is on for an assistant whose ``metadata.a2a.a2ui`` is true, or, unless
 that says false, for every assistant when ``A2A_A2UI_ENABLED`` is set. A client
-activates it by naming the extension in an ``A2A-Extensions`` (or
-``X-A2A-Extensions``) header; it is negotiated when both hold. A2UI travels in
-data parts whose ``metadata.mimeType`` is the A2UI MIME type: inbound they
-become content blocks of the user's message, outbound the agent's A2UI blocks
-and the results of the tools ``A2A_A2UI_TOOL_CALL_RESULTS`` names become such
-parts. Payloads are checked against the A2UI v0.9 schemas (a2ui_schemas/).
+activates it by naming the extension in the ``A2A-Extensions`` header; it is
+negotiated when both hold. A2UI travels in data parts whose
+``metadata.mimeType`` is the A2UI MIME type: inbound they become content blocks
+of the user's message, outbound the agent's A2UI blocks and the results of the
+tools ``A2A_A2UI_TOOL_CALL_RESULTS`` names become such parts. A task's runs
+record what was settled (``A2UIContext.run_metadata``), which its later reads
+take back (``run_context``). Payloads are checked against the A2UI v0.9
+schemas (a2ui_schemas/).
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ EXTENSION_URI = "https://a2ui.org/a2a-extension/a2ui/v0.9"
 MIME_TYPE = "application/json+a2ui"
 # The other spelling clients send; answered in the negotiated one.
 _ALTERNATE_MIME_TYPE = "application/a2ui+json"
-EXTENSION_HEADERS = ("a2a-extensions", "x-a2a-extensions")
+EXTENSION_HEADER = "a2a-extensions"
 
 _SCHEMAS = Path(__file__).with_name("a2ui_schemas")
 Direction = Literal["client", "server"]
@@ -54,13 +56,12 @@ def enabled_for(assistant_metadata: Mapping[str, Any] | None) -> bool:
 
 
 def extensions_requested(headers: Headers) -> list[str]:
-    """The extension URIs the request's extension headers name, each once, in order."""
+    """The extension URIs the request's ``A2A-Extensions`` headers name, each once, in order."""
     found: list[str] = []
-    for header in EXTENSION_HEADERS:
-        for value in headers.getlist(header):
-            for item in value.split(","):
-                if (uri := item.strip()) and uri not in found:
-                    found.append(uri)
+    for value in headers.getlist(EXTENSION_HEADER):
+        for item in value.split(","):
+            if (uri := item.strip()) and uri not in found:
+                found.append(uri)
     return found
 
 
@@ -93,6 +94,15 @@ class A2UIContext:
             return None
         return {"kind": "data", "data": data, "metadata": normalize_metadata(metadata, mime_type=self.mime_type)}
 
+    def run_metadata(self) -> dict[str, Any]:
+        """What a task's run records of this exchange under its ``a2a`` metadata; ``run_context`` reads it back."""
+        if not self.enabled:
+            return {}
+        recorded: dict[str, Any] = {"a2ui": True, "a2ui_active": self.active}
+        if self.negotiated:
+            recorded["a2ui_mime_type"] = self.mime_type
+        return recorded
+
     def parts_per_message(
         self, data: Any, metadata: Mapping[str, Any], *, direction: Direction
     ) -> list[dict[str, Any]]:
@@ -104,15 +114,12 @@ class A2UIContext:
         return [{**part, "data": message} for message in messages]
 
 
-DISABLED = A2UIContext()
-
-
 def message_context(
     message: Mapping[str, Any],
     assistant_metadata: Mapping[str, Any] | None,
     headers: Headers,
     *,
-    default_mime_type: str = MIME_TYPE,
+    default_mime_type: str,
 ) -> A2UIContext:
     """What an inbound message settles: A2UI on and active, its metadata, extensions and MIME type.
 
@@ -139,7 +146,7 @@ def message_context(
 
 
 def run_context(run_metadata: Mapping[str, Any] | None) -> A2UIContext:
-    """The A2UI a task's run was started with, as its ``a2a`` metadata recorded it."""
+    """The A2UI a task's run was started with, as ``A2UIContext.run_metadata`` recorded it under ``a2a``."""
     a2a = (run_metadata or {}).get("a2a")
     a2a = a2a if isinstance(a2a, dict) else {}
     mime_type = a2a.get("a2ui_mime_type")
@@ -150,33 +157,7 @@ def run_context(run_metadata: Mapping[str, Any] | None) -> A2UIContext:
     )
 
 
-def run_metadata(
-    assistant_metadata: Mapping[str, Any] | None,
-    context: A2UIContext,
-    *,
-    task_id: str | None,
-    task_start_id: str | None,
-) -> dict[str, Any]:
-    """The ``a2a`` metadata of a task's run: its task, and with A2UI on, the assistant's ``a2a`` settings and A2UI's."""
-    a2a = (assistant_metadata or {}).get("a2a")
-    inherited = (
-        {key: value for key, value in a2a.items() if key not in ("task_id", "task_start_id")}
-        if context.enabled and isinstance(a2a, dict)
-        else {}
-    )
-    recorded: dict[str, Any] = {**inherited}
-    if task_id:
-        recorded["task_id"] = task_id
-    if task_start_id:
-        recorded["task_start_id"] = task_start_id
-    if context.enabled:
-        recorded |= {"a2ui": True, "a2ui_active": context.active}
-    if context.negotiated:
-        recorded["a2ui_mime_type"] = context.mime_type
-    return {"a2a": recorded}
-
-
-def normalize_metadata(metadata: Mapping[str, Any], *, mime_type: str = MIME_TYPE) -> dict[str, Any]:
+def normalize_metadata(metadata: Mapping[str, Any], *, mime_type: str) -> dict[str, Any]:
     """Part metadata with an A2UI MIME type spelled as negotiated."""
     if is_mime_type(metadata.get("mimeType")):
         return {**metadata, "mimeType": mime_type}

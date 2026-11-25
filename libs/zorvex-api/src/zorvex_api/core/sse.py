@@ -46,10 +46,15 @@ def _decode_literal_unicode_escapes(data_str: str) -> str:
     )
 
 
+# SSE ends a line at CR and LF only, but readers that split lines as str.splitlines does (httpx's
+# aiter_lines, and so httpx-sse) also break at these, which JSON leaves raw: they go escaped.
+_LINE_BREAKS = str.maketrans({"\u0085": "\\u0085", "\u2028": "\\u2028", "\u2029": "\\u2029"})
+
+
 def event(name: str, data: Any, id: str | None = None) -> ServerSentEvent:
     """An SSE event: *data* as compact JSON (None is ``null``), with the id a client resumes after."""
     text = json.dumps(data, default=to_jsonable, separators=(",", ":"), ensure_ascii=False)
-    return ServerSentEvent(data=_decode_literal_unicode_escapes(text), event=name, id=id)
+    return ServerSentEvent(data=_decode_literal_unicode_escapes(text).translate(_LINE_BREAKS), event=name, id=id)
 
 
 class _Stream(EventSourceResponse):

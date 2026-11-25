@@ -15,32 +15,15 @@ from functools import cache
 from typing import Any
 
 from zorvex_api.config import ConfigurableHeadersConfig, load_config
+from zorvex_api.utils.run_utils import SERVER_KEYS, SERVER_PINNED_CONFIG_KEYS
 
+_CREDENTIALS = frozenset({"authorization", "x-api-key", "x-service-key", "x-tenant-id"})
 # Credentials no log shows, whatever http.logging_headers lets through.
-_SECRETS = frozenset({"authorization", "cookie", "set-cookie", "x-api-key", "x-service-key", "x-tenant-id"})
-
-_NEVER = frozenset(
-    {
-        "authorization",
-        "x-api-key",
-        "x-service-key",
-        "x-tenant-id",
-        "langgraph_auth_user",
-        "langgraph_auth_user_id",
-        "langgraph_auth_permissions",
-        "langgraph_request_id",
-        "user_id",
-        "thread_id",
-        "run_id",
-        "graph_id",
-        "assistant_id",
-        "cron_id",
-        "checkpoint_id",
-        "checkpoint_ns",
-        "__after_seconds__",
-        "__context_provided__",
-    }
-)
+_SECRETS = _CREDENTIALS | {"cookie", "set-cookie"}
+# What a header never sets in a run's configurable: credentials, who the run acts for
+# (langgraph_service.with_user), the run's ids and checkpoint, and the server's markers.
+_USER_KEYS = frozenset({"langgraph_auth_user", "langgraph_auth_user_id", "langgraph_auth_permissions", "user_id"})
+_NEVER = _CREDENTIALS | _USER_KEYS | SERVER_PINNED_CONFIG_KEYS | SERVER_KEYS | {"checkpoint_id", "checkpoint_ns"}
 
 # The configurable headers of the request being served.
 request_headers: ContextVar[dict[str, str] | None] = ContextVar("configurable_request_headers", default=None)

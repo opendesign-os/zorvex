@@ -1,9 +1,4 @@
-"""Export the OpenAPI spec to docs/openapi.json
-
-Generates the spec from the FastAPI app, normalizes the title/version to
-match the Zorvex project defaults, and removes any custom-route endpoints
-that are project-specific rather than part of the standard API.
-"""
+"""Export the API spec to docs/openapi.json: the core routes only, without a project's custom ones."""
 
 import json
 import logging
@@ -18,7 +13,6 @@ structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(logging.CRITICAL),
 )
 
-from zorvex_api import __version__  # noqa: E402
 from zorvex_api.main import OPENAPI_TAGS, app  # noqa: E402
 
 
@@ -26,12 +20,7 @@ def main() -> None:
     """Export the OpenAPI spec to docs/openapi.json."""
     schema = app.openapi()
 
-    # Normalize title and description to standard Zorvex values
-    schema["info"]["title"] = "Zorvex"
-    schema["info"]["version"] = __version__
-    schema["info"]["description"] = "Production-ready Agent Protocol server"
-
-    # Remove custom-route endpoints and untagged paths (root, custom routes)
+    # Untagged paths (the root) and custom routes are the project's, not the API's.
     core_tags: set[str] = {t["name"] for t in OPENAPI_TAGS}
     paths_to_remove: list[str] = []
     for path, methods in schema.get("paths", {}).items():

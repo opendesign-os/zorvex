@@ -1,11 +1,12 @@
 """Agent Protocol v2 event streaming endpoints.
 
-* ``POST /threads/{thread_id}/stream/events`` — SSE stream of a run's
-  events, filtered by channel. Body is an ``EventStreamRequest``.
-* ``POST /threads/{thread_id}/commands`` — run a thread command
-  (``run.start``, ``input.respond``) and get a JSON response envelope.
+* ``POST /threads/{thread_id}/stream/events``: the thread's run events over
+  SSE, filtered by channel; the body is an ``EventStreamRequest``.
+* ``POST /threads/{thread_id}/commands``: one thread command (``run.start``,
+  ``input.respond``, ``agent.getTree``), answered with its envelope.
+* ``/threads/{thread_id}/stream/events`` over a WebSocket: both, on one socket.
 
-Both verify thread (and run) ownership before doing anything.
+Each authorizes reading the thread first, and checks it is the caller's.
 """
 
 from __future__ import annotations
@@ -14,13 +15,12 @@ from collections.abc import AsyncGenerator
 
 import anyio
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket
+from fastapi import APIRouter, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sse_starlette import EventSourceResponse, ServerSentEvent
 
 from zorvex_api.core import sse
-from zorvex_api.core.auth_deps import require_auth
 from zorvex_api.core.authorization import Authorization, Authorize
 from zorvex_api.core.orm import Assistant as AssistantORM
 from zorvex_api.core.orm import Run as RunORM
@@ -28,7 +28,7 @@ from zorvex_api.core.orm import SessionDep, get_session_maker
 from zorvex_api.models import User
 from zorvex_api.models.event_streaming import EventStreamRequest, ThreadCommand
 from zorvex_api.services.event_streaming import ws
-from zorvex_api.services.event_streaming.commands import handle_command
+from zorvex_api.services.event_streaming.commands import INVALID_COMMAND, handle_command
 from zorvex_api.services.event_streaming.protocol import build_error
 from zorvex_api.services.event_streaming.session import RunLister, ThreadEventSession, validate_channels
 from zorvex_api.services.ownership import existing_thread, owned_thread
@@ -84,7 +84,6 @@ async def stream_thread_events(
     thread_id: str,
     body: EventStreamRequest,
     session: SessionDep,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "read"),
 ) -> EventSourceResponse:
     """Open a channel-filtered SSE stream of the thread's run events.
@@ -94,6 +93,7 @@ async def stream_thread_events(
     ``data:`` is a protocol event envelope; ``id:`` is the ``seq`` a client
     echoes back as ``since`` on resume.
     """
+    user = authorize.user
     channels, invalid = validate_channels(body.channels)
     if invalid:
         raise HTTPException(400, f"Unsupported channels: {', '.join(invalid)}")
@@ -130,7 +130,6 @@ async def post_thread_command(
     thread_id: str,
     request: Request,
     session: SessionDep,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "read"),
 ) -> JSONResponse:
     """Run one v2 command on the thread and answer its response envelope.
@@ -146,14 +145,12 @@ async def post_thread_command(
         raise HTTPException(400, "The command must be a JSON object") from None
     command_id = body.get("id") if isinstance(body, dict) else None
     if not isinstance(command_id, int) or isinstance(command_id, bool) or not isinstance(body.get("method"), str):
-        message = "Commands must include an integer id and string method."
-        return JSONResponse(build_error(None, "invalid_argument", message), status_code=400)
+        return JSONResponse(build_error(None, "invalid_argument", INVALID_COMMAND), status_code=400)
     try:
-        await existing_thread(session, thread_id, user, filters=filters)
+        await existing_thread(session, thread_id, authorize.user, filters=filters)
     except HTTPException as exc:
         return JSONResponse(build_error(command_id, "no_such_run", str(exc.detail)))
-    response, _run_id = await handle_command(body, session=session, thread_id=thread_id, user=user)
-    return JSONResponse(response)
+    return JSONResponse(await handle_command(body, session=session, thread_id=thread_id, authorize=authorize))
 
 
 @router.websocket("/threads/{thread_id}/stream/events")

@@ -19,22 +19,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, true
 from sqlalchemy.orm import InstrumentedAttribute
 from sqlalchemy.sql.elements import ColumnElement
 
 _MAX_FILTER_DEPTH = 2
 
 
-def build_metadata_filter(
-    column: InstrumentedAttribute[Any],
-    filters: dict[str, Any] | None,
-) -> ColumnElement[bool] | None:
-    """The predicate *filters* puts on the JSONB metadata ``column``, or None when there is none."""
+def build_metadata_filter(column: InstrumentedAttribute[Any], filters: dict[str, Any] | None) -> ColumnElement[bool]:
+    """The predicate *filters* puts on the JSONB metadata ``column``; TRUE when there is none."""
     if not filters:
-        return None
-    clauses = _compile(column, filters, depth=0)
-    return and_(*clauses) if len(clauses) > 1 else clauses[0]
+        return true()
+    return and_(*_compile(column, filters, depth=0))
 
 
 def _compile(

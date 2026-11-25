@@ -78,11 +78,7 @@ class ThreadService:
         # The id is taken. This read is the caller's only while thread ids are
         # global, so another user's thread is not adopted: it is a conflict.
         existing = await self.session.scalar(
-            select(ThreadORM).where(
-                ThreadORM.thread_id == thread_id,
-                ThreadORM.user_id == self.user.identity,
-                *visible_threads(filters),
-            )
+            select(ThreadORM).where(ThreadORM.thread_id == thread_id, visible_threads(self.user, filters))
         )
         if existing is not None and request.if_exists == "do_nothing":
             return existing

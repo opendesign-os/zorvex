@@ -1,5 +1,4 @@
-# Root pyproject.toml - Workspace configuration + dev tools
-# The actual packages are in libs/zorvex-api and libs/zorvex-cli
+# The uv workspace of zorvex-api and zorvex-cli (libs/), and the tools both are checked with.
 
 [project]
 name = "zorvex-workspace"
@@ -14,12 +13,14 @@ members = ["libs/*"]
 
 [dependency-groups]
 dev = [
+    "bandit>=1.9.4",
     "pre-commit>=4.7.0",
+    "ruff>=0.17.6",
+    "ty>=0.0.108,<0.1.0",
 ]
 
 [tool.ruff]
 line-length = 120
-target-version = "py312"
 
 [tool.ruff.lint]
 select = [
@@ -34,29 +35,23 @@ select = [
     "SIM",   # flake8-simplify
 ]
 ignore = [
-    "E501",   # line too long (handled by formatter)
-    "B008",   # do not perform function calls in argument defaults
-    "B904",   # Within an except clause, raise exceptions with `raise ... from err`
-    "ARG001", # Unused function argument
-    "ARG002", # Unused method argument
-    "ARG005", # Unused lambda argument
-    "SIM108", # Use ternary operator (less readable in many cases)
+    "E501",   # line length is the formatter's
+    "B008",   # function calls in argument defaults (FastAPI's Depends)
+    "B904",   # raise ... from err inside except
+    "ARG001", # unused function argument
+    "ARG002", # unused method argument
+    "ARG005", # unused lambda argument
+    "SIM108", # ternary operator
 ]
 
 [tool.ruff.lint.isort]
 known-first-party = ["zorvex_api", "zorvex_cli"]
 
-# ty replaces mypy for type checking. It uses its own rule system rather than
-# mypy-style strictness flags. Severity and per-rule overrides go in
-# [tool.ty.rules]; see https://docs.astral.sh/ty/reference/rules/ for details.
-[tool.ty.environment]
-python-version = "3.12"
-
 [tool.bandit]
 exclude_dirs = [".venv"]
 skips = [
     "B101",  # assert statements
-    "B404",  # import subprocess (needed for CLI)
-    "B603",  # subprocess without shell=True (needed for CLI)
-    "B607",  # partial executable path (needed for CLI to run docker, systemctl, etc.)
+    "B404",  # import subprocess (the CLI runs docker, podman and uvicorn)
+    "B603",  # subprocess without shell=True
+    "B607",  # partial executable path
 ]

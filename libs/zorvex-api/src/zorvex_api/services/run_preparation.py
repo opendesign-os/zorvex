@@ -11,12 +11,11 @@ from asgi_correlation_id import correlation_id
 from fastapi import HTTPException
 from langgraph_sdk import PriorityContext
 from langsmith import utils as ls_utils
-from sqlalchemy import ColumnElement, case, func, literal_column, or_, select, update
+from sqlalchemy import ColumnElement, case, func, literal_column, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from zorvex_api.config import load_config
-from zorvex_api.core.auth_filters import build_metadata_filter
 from zorvex_api.core.authorization import Authorization, Filters
 from zorvex_api.core.orm import Assistant as AssistantORM
 from zorvex_api.core.orm import Run as RunORM
@@ -28,11 +27,10 @@ from zorvex_api.models.run_job import RunIdentity, RunJob, RunKwargs
 from zorvex_api.observability.tracing import trace_markers
 from zorvex_api.services.executor import executor
 from zorvex_api.services.langgraph_service import get_langgraph_service
-from zorvex_api.services.ownership import existing_thread
+from zorvex_api.services.ownership import existing_thread, owned_assistant
 from zorvex_api.services.priority import ThreadPriority, assign, callback
 from zorvex_api.services.run_cleanup import delete_thread_by_id, request_run_interruption
 from zorvex_api.services.webhook_policy import admit_webhook
-from zorvex_api.utils.assistants import resolve_assistant_id
 from zorvex_api.utils.headers import request_headers
 from zorvex_api.utils.jsonb import jsonb_patch, jsonb_shallow_merge
 from zorvex_api.utils.run_utils import (
@@ -42,8 +40,9 @@ from zorvex_api.utils.run_utils import (
     LANGSMITH_EXAMPLE_ID,
     LANGSMITH_PROJECT,
     SERVER_KEYS,
-    _merge_jsonb,
+    merge_jsonb,
     merge_run_config,
+    stream_modes,
     strip_pinned_config_keys,
 )
 
@@ -63,12 +62,6 @@ _BOTH_CONFIGURABLE_AND_CONTEXT = (
     "Cannot specify both configurable and context. Prefer setting context alone. Context was introduced in "
     "LangGraph 0.6.0 and is the long term planned replacement for configurable."
 )
-
-
-def _modes(stream_mode: Any) -> list[Any]:
-    if stream_mode is None:
-        return []
-    return [stream_mode] if isinstance(stream_mode, str) else list(stream_mode)
 
 
 async def _validate_resume_command(thread_id: str, thread: ThreadORM | None, command: dict[str, Any] | None) -> None:
@@ -348,7 +341,7 @@ async def prepare_run(
     # Checked as the caller sent them, before a handler adds its own keys.
     if ((request.config or {}).get("configurable") or {}) and request.context:
         raise HTTPException(400, _BOTH_CONFIGURABLE_AND_CONTEXT)
-    if launch.protocol != "v2" and "lifecycle" in _modes(request.stream_mode):
+    if launch.protocol != "v2" and "lifecycle" in stream_modes(request.stream_mode):
         raise HTTPException(
             422, "stream_mode entries ['lifecycle'] are only supported on the v2 event streaming endpoints."
         )
@@ -363,44 +356,36 @@ async def prepare_run(
     await _validate_resume_command(thread_id, thread, request.command)
 
     config = request.config or {}
-    configurable = config.get("configurable", {})
-    if not isinstance(configurable, dict):
+    supplied = config.get("configurable", {})
+    if not isinstance(supplied, dict):
         raise HTTPException(status_code=422, detail="`config.configurable` must be a mapping")
+    # The server's markers are the server's to set (_markers), whatever the client sent.
+    configurable = {key: value for key, value in supplied.items() if key not in SERVER_KEYS}
     # Each mirrors the other, as on the Agent Server, under what a handler added; the marker
     # lets the run drop from the mirror what the graph's context schema leaves out.
     if request.context:
         context = request.context
-        configurable = {**request.context, **configurable, CONTEXT_PROVIDED: True}
+        mirrored = {key: value for key, value in context.items() if key not in SERVER_KEYS}
+        configurable = {**mirrored, **configurable, CONTEXT_PROVIDED: True}
     else:
         context = configurable.copy()
     # The checkpoint to start from rides in configurable, as the Agent Server keeps it; the ids are the server's.
     checkpoint = strip_pinned_config_keys(_resolve_checkpoint(request) or {})
     configurable = {
-        # A cron's id and the trace context are the server's to set (_markers).
-        **{key: value for key, value in configurable.items() if key not in SERVER_KEYS},
+        **configurable,
         **(request_headers.get() or {}),
         **{key: value for key, value in checkpoint.items() if value is not None},
         **_markers(request, launch),
     }
     config = {**config, "configurable": configurable}
 
-    graphs = get_langgraph_service().list_graphs()
-    assistant_id = resolve_assistant_id(request.assistant_id, graphs)
+    graphs = get_langgraph_service()
+    assistant_id = graphs.assistant_id(request.assistant_id)
     assistant_filters: Filters | None = None
     if authorize is not None:
-        assistant_filters = await Authorization(user, "assistants", "read")({"assistant_id": assistant_id})
-    assistant_filter = build_metadata_filter(AssistantORM.metadata_dict, assistant_filters)
-    assistant = await session.scalar(
-        select(AssistantORM).where(
-            AssistantORM.assistant_id == assistant_id,
-            or_(AssistantORM.user_id == user.identity, AssistantORM.user_id == "system"),
-            *([] if assistant_filter is None else [assistant_filter]),
-        )
-    )
-    if assistant is None:
-        raise HTTPException(404, f"Assistant '{request.assistant_id}' not found")
-    if assistant.graph_id not in graphs:
-        raise HTTPException(404, f"Graph '{assistant.graph_id}' not found for assistant")
+        assistant_filters = await authorize.to("assistants", "read")({"assistant_id": assistant_id})
+    assistant = await owned_assistant(session, assistant_id, user, filters=assistant_filters)
+    graphs.require_graph(assistant.graph_id)
 
     strategy = request.multitask_strategy or "enqueue"
     active: list[RunORM] = []
@@ -465,7 +450,7 @@ async def prepare_run(
             input=request.input,  # None continues from the checkpoint
             command=request.command,
             config=merge_run_config(assistant.config, config),
-            context=_merge_jsonb(assistant.context, context),
+            context=merge_jsonb(assistant.config.get("configurable"), context),
             stream_mode=request.stream_mode,
             interrupt_before=request.interrupt_before,
             interrupt_after=request.interrupt_after,
@@ -534,3 +519,17 @@ async def prepare_stateless_run(
     except Exception:
         await delete_thread_by_id(thread_id, user.identity)
         raise
+
+
+async def create_run(
+    authorize: Authorization, thread_id: str | None, request: RunCreate, *, launch: Launch | None = None
+) -> Run:
+    """Start a run as ``POST /threads/{thread_id}/runs`` does, or without a thread as ``POST /runs`` does.
+
+    *authorize* is its caller's ``threads.create_run``; the run is pending when this returns.
+    """
+    launch = launch or Launch()
+    async with get_session_maker()() as session:
+        if thread_id is None:
+            return await prepare_stateless_run(session, request, authorize.user, authorize=authorize, launch=launch)
+        return await prepare_run(session, thread_id, request, authorize.user, authorize=authorize, launch=launch)

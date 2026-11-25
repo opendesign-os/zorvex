@@ -13,12 +13,12 @@ from functools import cache
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from langgraph.store.base import Item
 
 from zorvex_api.config import load_config
-from zorvex_api.core.auth_deps import auth_dependency, require_auth
+from zorvex_api.core.auth import auth_dependency
 from zorvex_api.core.authorization import Authorization, Authorize
 from zorvex_api.core.database import db_manager
 from zorvex_api.models import (
@@ -42,7 +42,6 @@ router = APIRouter(tags=["Store"], dependencies=auth_dependency)
 @router.put("/store/items", status_code=204)
 async def put_store_item(
     request: StorePutRequest,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("store", "put"),
 ) -> Response:
     """Create or update an item in the store.
@@ -50,6 +49,7 @@ async def put_store_item(
     If an item with the same namespace and key already exists, its value is
     overwritten. Values must be JSON objects (dictionaries).
     """
+    user = authorize.user
     value: dict[str, Any] = {
         "namespace": tuple(request.namespace),
         "key": request.key,
@@ -72,13 +72,13 @@ async def get_store_item(
     key: str | None = Query(None, description="Key of the item to retrieve."),
     namespace: str = Query("", description="Namespace path, its labels joined with dots."),
     refresh_ttl: bool | None = Query(None, description="Refresh the item's TTL on read."),
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("store", "get"),
 ) -> StoreItem:
     """Get an item from the store by key.
 
     Returns 400 without a key, 404 if no item exists at the given namespace and key.
     """
+    user = authorize.user
     if not key:
         raise HTTPException(400, "Key is required")
     value: dict[str, Any] = {"namespace": tuple(label for label in namespace.split(".") if label), "key": key}
@@ -96,10 +96,10 @@ async def get_store_item(
 @router.delete("/store/items", status_code=204)
 async def delete_store_item(
     request: StoreDeleteRequest,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("store", "delete"),
 ) -> Response:
     """Delete an item from the store."""
+    user = authorize.user
     value: dict[str, Any] = {"namespace": tuple(request.namespace), "key": request.key}
     await authorize(value)
     await db_manager.get_store().adelete(_scoped(value["namespace"], user), value["key"])
@@ -109,7 +109,6 @@ async def delete_store_item(
 @router.post("/store/items/search", response_model=StoreSearchResponse)
 async def search_store_items(
     request: StoreSearchRequest,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("store", "search"),
 ) -> StoreSearchResponse:
     """Search items in the store.
@@ -117,6 +116,7 @@ async def search_store_items(
     Filter items by namespace prefix, key-value metadata filters, or semantic
     query. Results are paginated via `limit` and `offset`.
     """
+    user = authorize.user
     value: dict[str, Any] = {
         "namespace": tuple(request.namespace_prefix),
         "filter": request.filter,
@@ -139,7 +139,6 @@ async def search_store_items(
 @router.post("/store/namespaces", response_model=StoreListNamespacesResponse)
 async def list_namespaces(
     request: StoreListNamespacesRequest,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("store", "list_namespaces"),
 ) -> StoreListNamespacesResponse:
     """List namespaces in the store.
@@ -147,6 +146,7 @@ async def list_namespaces(
     Returns the namespace paths that contain items. Filter by prefix, suffix,
     or maximum depth.
     """
+    user = authorize.user
     value: dict[str, Any] = {
         "namespace": tuple(request.prefix) if request.prefix else None,
         "suffix": tuple(request.suffix) if request.suffix else None,

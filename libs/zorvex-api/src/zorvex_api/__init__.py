@@ -1,4 +1,4 @@
-"""Zorvex API - Self-hosted Agent Protocol server."""
+"""The Zorvex server: the LangGraph Agent Server API, self-hosted on PostgreSQL."""
 
 from importlib.metadata import version
 

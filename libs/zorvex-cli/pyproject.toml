@@ -1,7 +1,7 @@
 [project]
 name = "zorvex-cli"
 version = "0.0.2"
-description = "Zorvex CLI - Manage your self-hosted agent deployments"
+description = "The zorvex command: create, run and deploy LangGraph agents on Zorvex"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -45,15 +45,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zorvex_cli"]
-
-[tool.ruff]
-line-length = 100
-target-version = "py312"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
-
-[dependency-groups]
-dev = [
-    "ruff>=0.17.6",
-]

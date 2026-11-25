@@ -2,8 +2,8 @@
 
 Single source of truth for executing a graph run. Both LocalExecutor
 (asyncio.create_task) and WorkerExecutor (Redis job queue) call
-`execute_run`. All database and broker interactions are delegated to
-`run_status` and `streaming_service` respectively.
+`execute_run`; it records the run's status (run_status) and streams its
+events to the broker.
 """
 
 import asyncio
@@ -22,13 +22,15 @@ from zorvex_api.core.active_runs import active_runs, executing_runs
 from zorvex_api.models.enums import RunStatus, StreamMode, ThreadStatus
 from zorvex_api.models.run_job import RunJob
 from zorvex_api.observability.tracing import run_span, start_run_trace
+from zorvex_api.services import streaming_service
+from zorvex_api.services.base_broker import cancelled_error
 from zorvex_api.services.broker import broker_manager
 from zorvex_api.services.event_streaming.native_stream import stream_native_v3_events
 from zorvex_api.services.graph_streaming import stream_graph_events
 from zorvex_api.services.langgraph_service import create_run_config, create_thread_config, get_langgraph_service
 from zorvex_api.services.run_cancel import end_cancelled_run
 from zorvex_api.services.run_status import Ending, finalize_run, start_run
-from zorvex_api.services.streaming_service import error_event, streaming_service
+from zorvex_api.services.streaming_service import error_event
 from zorvex_api.services.thread_state_service import snapshot_values
 from zorvex_api.services.webhook_delivery import finish_executing
 from zorvex_api.utils.run_utils import (
@@ -38,12 +40,14 @@ from zorvex_api.utils.run_utils import (
     LANGSMITH_PROJECT,
     map_command_to_langgraph,
     resolve_graph_context,
+    stream_modes,
 )
 
 logger = structlog.getLogger(__name__)
 
 _DEFAULT_STREAM_MODES = ["values"]
-_V2_MODES = frozenset({"tools", "lifecycle"})
+# The v2 stream's own mode; a v1 run that asked for it streams the rest (prepare_run refuses lifecycle).
+_V2_MODES = frozenset({"tools"})
 
 # Cancellation provenance prevents infrastructure stops from looking user-initiated.
 _lease_loss_cancellations: set[str] = set()
@@ -101,14 +105,14 @@ async def _execute(job: RunJob) -> None:
                 run_id, thread_id, final.ending("timeout", error), user_id=user_id, webhook_job=job
             )
             if finalized:
-                await _best_effort_signal(streaming_service.signal_run_error, run_id, error, "timeout")
+                await _best_effort_signal(streaming_service.end_run, run_id, "timeout", error)
         else:
             # A user's cancel: interrupted, or rolled back, as the cancel recorded on the run asks.
             finalized, error = await end_cancelled_run(
                 run_id, thread_id, final.ending("interrupted"), user_id=user_id, webhook_job=job
             )
             if finalized:
-                await _best_effort_signal(streaming_service.signal_run_cancelled, run_id, error)
+                await _best_effort_signal(streaming_service.end_run, run_id, "interrupted", error or cancelled_error())
         raise
     except Exception as exc:
         logger.exception("Run failed", run_id=run_id)
@@ -117,10 +121,10 @@ async def _execute(job: RunJob) -> None:
             run_id, thread_id, final.ending("error", error), user_id=user_id, webhook_job=job
         )
         if finalized:
-            await _best_effort_signal(streaming_service.signal_run_error, run_id, error)
+            await _best_effort_signal(streaming_service.end_run, run_id, "error", error)
     else:
         if finalized:
-            await _best_effort_signal(_signal_end_event, run_id, "success")
+            await _best_effort_signal(streaming_service.end_run, run_id, "success")
     finally:
         _lease_loss_cancellations.discard(run_id)
         _shutdown_cancellations.discard(run_id)
@@ -241,12 +245,11 @@ async def _stream_graph(job: RunJob, final: _FinalState) -> None:
                 )
             run_id = job.identity.run_id
             async for event in events:
-                await streaming_service.put_to_broker(run_id, await broker_manager.allocate_event_id(run_id), event)
+                await broker_manager.publish(run_id, event)
             # The graph has returned: the stream's last event before its end, as on the Agent Server.
             keys = job.kwargs.feedback_keys
             if keys and not events_v2 and (urls := await _feedback_urls(run_id, keys)):
-                event_id = await broker_manager.allocate_event_id(run_id)
-                await streaming_service.put_to_broker(run_id, event_id, ("feedback", urls))
+                await broker_manager.publish(run_id, ("feedback", urls))
         finally:
             await _read_final_state(graph, job, final)
 
@@ -296,32 +299,10 @@ def _resolve_input(job: RunJob) -> Any:
 
 
 def _resolve_stream_modes(stream_mode: StreamMode | list[StreamMode] | None) -> list[str]:
-    """The modes a v1 stream carries; ``tools`` and ``lifecycle`` belong to the v2 one, so none of them."""
+    """The modes a v1 stream carries: values when the run named none, and never the v2 stream's own."""
     if stream_mode is None:
         return _DEFAULT_STREAM_MODES.copy()
-    modes = [stream_mode] if isinstance(stream_mode, str) else list(stream_mode)
-    return [mode for mode in modes if mode not in _V2_MODES]
-
-
-# ------------------------------------------------------------------
-# End event (tells SSE consumers the stream is finished)
-# ------------------------------------------------------------------
-
-
-async def _signal_end_event(run_id: str, status: str) -> None:
-    """Publish an 'end' event to the broker so SSE consumers close cleanly.
-
-    Without this, the SSE connection hangs after the last data event
-    because the broker never signals completion on success/interrupt.
-    Error and cancel paths already send end events via signal_run_error
-    and signal_run_cancelled respectively.
-    """
-    broker = broker_manager.get_broker(run_id)
-    if broker is None or broker.is_finished():
-        return
-
-    event_id = await broker_manager.allocate_event_id(run_id)
-    await broker.put(event_id, ("end", {"status": status}))
+    return [mode for mode in stream_modes(stream_mode) if mode not in _V2_MODES]
 
 
 async def _signal_run_done(run_id: str) -> None:

@@ -29,9 +29,10 @@ from zorvex_api.core.orm import get_session_maker
 from zorvex_api.models.auth import User
 from zorvex_api.models.enums import ACTIVE_RUN_STATUSES, TERMINAL_RUN_STATUSES
 from zorvex_api.services import thread_events
+from zorvex_api.services.base_broker import event_id as make_event_id
+from zorvex_api.services.base_broker import event_sequence
 from zorvex_api.services.broker import broker_manager, live_events
-from zorvex_api.services.event_converter import to_sse
-from zorvex_api.utils.sse_utils import extract_event_sequence
+from zorvex_api.services.streaming_service import to_sse
 
 MODES = ("run_modes", "lifecycle", "state_update")
 _POLL_SECONDS = 0.5
@@ -107,32 +108,37 @@ async def _runs(
             if replay_all
             else or_(RunORM.status.in_(ACTIVE_RUN_STATUSES), RunORM.created_at >= since)
         )
-        async with get_session_maker()() as session:
-            runs = (
-                await session.execute(
-                    select(RunORM.run_id, RunORM.status, RunORM.updated_at)
-                    .where(RunORM.thread_id == thread_id, RunORM.user_id == user.identity, condition)
-                    .order_by(RunORM.created_at, RunORM.run_id)
-                )
-            ).all()
+        stmt = (
+            select(RunORM.run_id, RunORM.status, RunORM.updated_at)
+            .where(RunORM.thread_id == thread_id, RunORM.user_id == user.identity, condition)
+            .order_by(RunORM.created_at, RunORM.run_id)
+        )
+        # Shielded: the stream stops this task when its client goes, and a query cut off mid-flight
+        # closes its connection; it finishes instead, in a task of its own.
+        runs = await asyncio.shield(_rows(stmt))
         for run_id, status, updated_at in runs:
             if run_id in seen:
                 continue
             seen.add(run_id)
-            after = f"{run_id}_event_{resume_seq}" if run_id == resume_run else None
+            after = resume_seq if run_id == resume_run else 0
             async for message in _run(run_id, status, updated_at, after, modes):
                 await out.put(message)
         await asyncio.sleep(_POLL_SECONDS)
 
 
+async def _rows(stmt: Any) -> list[Any]:
+    async with get_session_maker()() as session:
+        return list((await session.execute(stmt)).all())
+
+
 async def _run(
-    run_id: str, status: str, updated_at: datetime, after: str | None, modes: frozenset[str]
+    run_id: str, status: str, updated_at: datetime, after: int, modes: frozenset[str]
 ) -> AsyncGenerator[ServerSentEvent]:
-    """One run's events (stored, then live), its end as ``run_done``."""
-    last = 0
+    """One run's events after sequence *after* (stored, then live), its end as ``run_done``."""
+    last = after
     # Read without registering a broker: the run may have ended long ago.
-    for event_id, payload in await broker_manager.replay(run_id, after):
-        last = extract_event_sequence(event_id)
+    for event_id, payload in await broker_manager.replay(run_id, make_event_id(run_id, after) if after else None):
+        last = event_sequence(event_id)
         message, ended = _message(run_id, event_id, payload, modes)
         if message is not None:
             yield message
@@ -143,7 +149,7 @@ async def _run(
     # or never were (stream_resumable), as on the Agent Server.
     ended_at = updated_at if status in TERMINAL_RUN_STATUSES else None
     async for event_id, payload in live_events(run_id, ended_at=ended_at):
-        if extract_event_sequence(event_id) <= last:
+        if event_sequence(event_id) <= last:
             continue
         message, ended = _message(run_id, event_id, payload, modes)
         if message is not None:
@@ -168,4 +174,4 @@ def _resume_point(last_event_id: str | None) -> tuple[str | None, int]:
     if not last_event_id or last_event_id == "-" or "_event_" not in last_event_id:
         return None, 0
     run_id, _, _ = last_event_id.rpartition("_event_")
-    return run_id, extract_event_sequence(last_event_id)
+    return run_id, event_sequence(last_event_id)

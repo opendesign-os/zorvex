@@ -1,21 +1,28 @@
-"""Thread state: LangGraph snapshots in the Agent Protocol ThreadState shape, and a thread's current values."""
+"""Thread state: LangGraph snapshots in the Agent Protocol ThreadState shape, and the values a thread row keeps."""
 
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 from langgraph.types import StateSnapshot
+from sqlalchemy import case, exists, literal, select, update
 
+from zorvex_api.core.orm import Run as RunORM
 from zorvex_api.core.orm import Thread as ThreadORM
+from zorvex_api.core.orm import get_session_maker
 from zorvex_api.core.serializers import to_jsonable
 from zorvex_api.models.auth import User
+from zorvex_api.models.enums import ACTIVE_RUN_STATUSES
 from zorvex_api.models.threads import ThreadCheckpoint, ThreadState
-from zorvex_api.services.langgraph_service import create_thread_config, get_langgraph_service, thread_graph_config
+from zorvex_api.services import thread_events
+from zorvex_api.services.langgraph_service import get_langgraph_service
 
 logger = structlog.getLogger(__name__)
 
 
-def _checkpoint(config: Mapping[str, Any] | None, thread_id: str) -> ThreadCheckpoint:
+def checkpoint(config: Mapping[str, Any] | None, thread_id: str) -> ThreadCheckpoint:
+    """The checkpoint a snapshot's (or an update's) config points at."""
     configurable = (config or {}).get("configurable", {})
     return ThreadCheckpoint(
         checkpoint_id=configurable.get("checkpoint_id"),
@@ -34,7 +41,7 @@ def _task(task: Any, thread_id: str) -> dict[str, Any]:
         "interrupts": to_jsonable(task.interrupts),
         "checkpoint": state["configurable"] if isinstance(state, dict) else None,
         "state": snapshot_to_thread_state(state, thread_id) if isinstance(state, StateSnapshot) else None,
-        "result": to_jsonable(getattr(task, "result", None)),
+        "result": to_jsonable(task.result),
     }
 
 
@@ -46,9 +53,14 @@ def snapshot_to_thread_state(snapshot: StateSnapshot, thread_id: str) -> ThreadS
         interrupts=to_jsonable(snapshot.interrupts),
         metadata=dict(snapshot.metadata or {}),
         created_at=snapshot.created_at,
-        checkpoint=_checkpoint(snapshot.config, thread_id),
-        parent_checkpoint=_checkpoint(snapshot.parent_config, thread_id) if snapshot.parent_config else None,
+        checkpoint=checkpoint(snapshot.config, thread_id),
+        parent_checkpoint=checkpoint(snapshot.parent_config, thread_id) if snapshot.parent_config else None,
     )
+
+
+def empty_state(thread_id: str) -> ThreadState:
+    """The state of a thread no run has bound to a graph yet."""
+    return ThreadState(values={}, checkpoint=checkpoint(None, thread_id))
 
 
 async def read_thread_values(thread: ThreadORM, user: User) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -60,15 +72,15 @@ async def read_thread_values(thread: ThreadORM, user: User) -> tuple[dict[str, A
     a run that failed on a message it could not read: the Agent Server shows
     such a thread from what it stored, where Zorvex reads the state again.
     """
-    graph_id = (thread.metadata_dict or {}).get("graph_id")
-    if not graph_id or graph_id not in get_langgraph_service().list_graphs():
+    service = get_langgraph_service()
+    if thread.metadata_dict.get("graph_id") not in service.list_graphs():
         return {}, {}
-    config = create_thread_config(thread.thread_id, user)
-    async with get_langgraph_service().get_graph(
-        graph_id, thread_graph_config(thread.config, config), access_context="threads.read", user=user
-    ) as agent:
+    async with service.thread_graph(thread, user, access_context="threads.read") as bound:
+        if bound is None:
+            return {}, {}
+        graph, config = bound
         try:
-            snapshot = await agent.aget_state(config)
+            snapshot = await graph.aget_state(config)
         except ValueError:
             logger.warning("Thread state cannot be read; its values read as empty", thread_id=thread.thread_id)
             return {}, {}
@@ -78,7 +90,30 @@ async def read_thread_values(thread: ThreadORM, user: User) -> tuple[dict[str, A
 def snapshot_values(snapshot: StateSnapshot) -> tuple[dict[str, Any], dict[str, Any]]:
     """A snapshot's values and its pending interrupts by task id, as JSON, as a thread shows them."""
     values = snapshot.values if isinstance(snapshot.values, dict) else {}
-    interrupts = {
-        task.id: to_jsonable(task.interrupts) for task in (snapshot.tasks or []) if getattr(task, "interrupts", None)
-    }
+    interrupts = {task.id: to_jsonable(task.interrupts) for task in snapshot.tasks if task.interrupts}
     return to_jsonable(values), interrupts
+
+
+async def record_state(thread_id: str, user: User, state: StateSnapshot) -> None:
+    """Keep a state written outside a run as the thread's, and tell the thread's followers.
+
+    The thread row takes its values and state time, and its status unless a run is on it.
+    """
+    values, interrupts = snapshot_values(state)
+    now = datetime.now(UTC)
+    active = exists(
+        select(RunORM.run_id)
+        .where(RunORM.thread_id == ThreadORM.thread_id, RunORM.status.in_(ACTIVE_RUN_STATUSES))
+        .correlate(ThreadORM)
+    )
+    status = case((active, ThreadORM.status), else_=literal("interrupted" if state.next else "idle"))
+    async with get_session_maker()() as session:
+        await session.execute(
+            update(ThreadORM)
+            .where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+            .values(updated_at=now, state_updated_at=now, status=status, values=values, interrupts=interrupts)
+        )
+        await session.commit()
+    await thread_events.publish(
+        thread_id, "state_update", {"state": snapshot_to_thread_state(state, thread_id), "thread_id": thread_id}
+    )

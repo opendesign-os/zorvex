@@ -1,43 +1,27 @@
-"""Configurable runtime context for $project_name."""
-
-from __future__ import annotations
+"""Runtime context for $project_name: what each run can set."""
 
 import os
 from dataclasses import dataclass, field
-from typing import Annotated
 
 from $slug import prompts
 
 
 @dataclass(kw_only=True)
 class Context:
-    """Runtime configuration injected into the graph.
+    """The graph's runtime context.
 
-    Defaults can be overridden per-request via the LangGraph SDK
-    or globally via environment variables.
+    A run sets fields in its context. A field it leaves out is MODEL or SYSTEM_PROMPT from the
+    environment when set, else the default here.
     """
 
     system_prompt: str = field(
-        default=prompts.SYSTEM_PROMPT,
+        default_factory=lambda: os.environ.get("SYSTEM_PROMPT") or prompts.SYSTEM_PROMPT,
+        metadata={"description": "The system prompt for the agent; {system_time} is the current time."},
+    )
+    model: str = field(
+        default_factory=lambda: os.environ.get("MODEL") or "openai/gpt-4o-mini",
         metadata={
-            "description": "The system prompt for the agent.",
+            "description": "LLM model as 'provider/model'. The model id may contain slashes for gateway "
+            "routes, e.g. 'openai/deepseek-ai/DeepSeek-V3'."
         },
     )
-    model: Annotated[
-        str,
-        {
-            "description": "LLM model as 'provider/model'. The model id may contain "
-            "slashes for gateway routes, e.g. 'openai/deepseek-ai/DeepSeek-V3'."
-        },
-    ] = field(
-        default="openai/gpt-4o-mini",
-    )
-
-    def __post_init__(self) -> None:
-        """Override defaults with environment variables when set."""
-        env_model = os.environ.get("MODEL")
-        if env_model:
-            self.model = env_model
-        env_prompt = os.environ.get("SYSTEM_PROMPT")
-        if env_prompt:
-            self.system_prompt = env_prompt

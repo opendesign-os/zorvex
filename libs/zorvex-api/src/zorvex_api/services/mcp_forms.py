@@ -115,15 +115,6 @@ class _Definitions:
 
     def resolved(self, node: Schema) -> Schema:
         """*node* with its reference replaced by the definition (less its title), *node*'s own keywords kept."""
-        all_of = node.get("allOf")
-        if (
-            isinstance(all_of, list)
-            and len(all_of) == 1
-            and isinstance(all_of[0], dict)
-            and isinstance(all_of[0].get("$ref"), str)
-        ):
-            siblings = {key: value for key, value in node.items() if key != "allOf"}
-            return self.resolved({**all_of[0], **siblings})
         if "$ref" not in node:
             return node
         ref = node["$ref"]

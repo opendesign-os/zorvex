@@ -13,7 +13,8 @@ skip the leading whitespace.
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -28,7 +29,7 @@ from zorvex_api.models.enums import ACTIVE_RUN_STATUSES
 from zorvex_api.services.base_broker import cancelled_error
 from zorvex_api.services.broker import broker_manager
 from zorvex_api.services.executor import executor
-from zorvex_api.services.run_cleanup import DISCONNECT_REASON, cancel_run_by_id
+from zorvex_api.services.run_cleanup import cancel_on_disconnect
 from zorvex_api.services.thread_state_service import read_thread_values
 from zorvex_api.settings import settings
 
@@ -125,6 +126,23 @@ async def _stored_result(run_id: str, thread_id: str, user: User, *, timed_out: 
     return {**values, INTERRUPT_KEY: pending} if pending else values
 
 
+async def wait_for_result(run_id: str, thread_id: str, user: User) -> dict[str, Any]:
+    """The run's result once it ends, as ``wait_body`` sends it, for a caller that holds no connection open.
+
+    Gives up waiting after ``BG_JOB_TIMEOUT_SECS`` and answers what the run has come to by then.
+    """
+    timed_out = False
+    timeout = settings.worker.BG_JOB_TIMEOUT_SECS
+    try:
+        await executor.wait_for_completion(run_id, timeout=timeout)
+    except TimeoutError:
+        timed_out = True
+        logger.warning("Wait timed out", run_id=run_id, timeout=timeout)
+    except Exception:
+        logger.exception("Wait failed", run_id=run_id)
+    return await run_result(run_id, thread_id, user, timed_out=timed_out)
+
+
 def encode_result(body: dict[str, Any]) -> bytes:
     """A result body as JSON bytes."""
     return json.dumps(to_jsonable(body)).encode()
@@ -167,7 +185,7 @@ async def wait_body(
             except TimeoutError:
                 if is_disconnected is not None and await is_disconnected():
                     logger.info("Client disconnected, cancelling run", run_id=run_id)
-                    await cancel_run_by_id(run_id, action="interrupt", reason=DISCONNECT_REASON)
+                    await cancel_on_disconnect(run_id)
                     return
                 yield b"\n"
     finally:
@@ -177,3 +195,48 @@ async def wait_body(
                 await task
 
     yield encode_result(await run_result(run_id, thread_id, user, timed_out=timed_out))
+
+
+@dataclass(frozen=True, slots=True)
+class Completed:
+    """A run that finished: its result, the values it ended with."""
+
+    values: Any
+
+
+@dataclass(frozen=True, slots=True)
+class Failed:
+    """A run that failed: its error, as its result reports it."""
+
+    error: Any
+
+
+@dataclass(frozen=True, slots=True)
+class Paused:
+    """A run that paused for input: the interrupts it waits on, as ``public_interrupt`` shows them."""
+
+    interrupts: tuple[dict[str, Any], ...]
+
+
+RunOutcome = Completed | Failed | Paused
+
+
+def run_outcome(result: Any) -> RunOutcome:
+    """What a run's result (a wait's, or a stream's last values) says it came to: its error, the interrupts it
+    paused on, or its values."""
+    if isinstance(result, Mapping):
+        if ERROR_KEY in result:
+            return Failed(result[ERROR_KEY])
+        if INTERRUPT_KEY in result:
+            return Paused(tuple(public_interrupt(item) for item in result[INTERRUPT_KEY] or ()))
+    return Completed(result)
+
+
+def public_interrupt(item: Any) -> dict[str, Any]:
+    """An interrupt as the Agent Server shows one: its id and value, and its response schema when it has one."""
+    if not isinstance(item, Mapping):
+        return {"id": None, "value": item}
+    shown = {"id": item.get("id"), "value": item.get("value")}
+    if item.get("response_schema") is not None:
+        shown["response_schema"] = item["response_schema"]
+    return shown

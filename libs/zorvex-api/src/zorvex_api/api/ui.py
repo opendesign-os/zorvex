@@ -13,13 +13,13 @@ from pathlib import Path
 from urllib.parse import quote
 
 from anyio import Path as AsyncPath
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, Response
 
 from zorvex_api.config import config_dir
-from zorvex_api.core.auth_deps import require_auth
+from zorvex_api.core.auth import auth_dependency
 
-router = APIRouter(tags=["UI"], dependencies=[Depends(require_auth)])
+router = APIRouter(tags=["UI"], dependencies=auth_dependency)
 
 
 def ui_dir() -> Path:

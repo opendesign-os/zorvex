@@ -74,9 +74,8 @@ class DatabaseSettings(EnvBase):
     """Database connection.
 
     DATABASE_URI is a libpq connection URL (postgresql://user:password@host:5432/db,
-    password URL-encoded). Both drivers parse it themselves, psycopg through libpq
-    and asyncpg through its own DSN parser, so multiple hosts, sslmode, sslrootcert,
-    target_session_attrs and the PG* environment variables work as in libpq.
+    password URL-encoded), which libpq parses for every connection: multiple hosts,
+    sslmode, sslrootcert, target_session_attrs and the PG* environment variables work.
     """
 
     DATABASE_URI: str = "postgresql://postgres:postgres@localhost:5432/zorvex"
@@ -183,11 +182,8 @@ class CronSettings(EnvBase):
     FF_CRONS_ENABLED: bool = True
     # Seconds the scheduler sleeps between polls for due crons.
     CRON_SCHEDULER_SLEEP_TIME: int = Field(default=5, gt=0)
-    # Maximum lease duration for an in-flight cron firing. Once a cron is
-    # claimed by ``get_due_crons`` its ``claimed_until`` is set to
-    # ``now + CRON_CLAIM_DURATION_SECONDS`` so concurrent pollers and
-    # subsequent ticks don't double-fire it. Should comfortably exceed the
-    # worst-case ``_fire_cron`` duration. Defaults to 5 minutes.
+    # How long a claimed cron is held (``claimed_until``) so other pollers and later ticks
+    # do not fire it again; it should outlast the slowest firing.
     CRON_CLAIM_DURATION_SECONDS: int = Field(default=300, gt=0)
     # Cap on how many crons a single user may own. Set to 0 to disable.
     CRON_MAX_PER_USER: int = Field(default=100, ge=0)
@@ -201,7 +197,7 @@ class CronSettings(EnvBase):
     CRON_MAX_PAYLOAD_BYTES: int = Field(default=64 * 1024, gt=0)
 
 
-WEBHOOK_SECRET_PREFIX = "whsec_"  # nosec B105 - the key format's prefix, not a key
+WEBHOOK_SECRET_PREFIX = "whsec_"  # nosec B105  # the key format's prefix, not a key
 
 
 def _tool_names(value: str) -> frozenset[str]:

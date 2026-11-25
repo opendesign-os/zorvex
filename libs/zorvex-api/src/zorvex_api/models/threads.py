@@ -4,17 +4,15 @@ import re
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from zorvex_api.models.entity_ids import ENTITY_ID_PATTERN, MAX_ENTITY_ID_LENGTH
-from zorvex_api.models.enums import OnConflictBehavior, PruneStrategy, SortOrder, ThreadSortBy, ThreadStatus
-from zorvex_api.models.search import SearchLimit, SearchOffset
+from zorvex_api.models.enums import OnConflictBehavior, PruneStrategy, ThreadSortBy, ThreadStatus
+from zorvex_api.models.search import SearchPage
 
 # Upper bound keeping now + timedelta(minutes=ttl) finite and timedelta-safe
 # (timedelta.max is ~1.44e9 minutes); rejects inf/1e308 at validation time.
 MAX_TTL_MINUTES = 1_000_000_000
-
-MAX_THREAD_ID_LENGTH = MAX_ENTITY_ID_LENGTH
 
 
 class ThreadTTLSpec(BaseModel):
@@ -36,12 +34,12 @@ class ThreadCreate(BaseModel):
     thread_id: str | None = Field(
         None,
         min_length=1,
-        max_length=MAX_THREAD_ID_LENGTH,
+        max_length=MAX_ENTITY_ID_LENGTH,
         pattern=ENTITY_ID_PATTERN,
         description=(
             "Optional client-provided thread ID for idempotent creation. "
             "Omit or null to let the server generate a UUID. "
-            f"When set, 1–{MAX_THREAD_ID_LENGTH} characters and not blank "
+            f"When set, 1–{MAX_ENTITY_ID_LENGTH} characters and not blank "
             "(must fit PostgreSQL btree keys uncompressed)."
         ),
     )
@@ -56,8 +54,7 @@ class ThreadCreate(BaseModel):
         None,
         description=(
             "Checkpoint history to seed the thread with. Each superstep is "
-            '{"updates": [{"values": ..., "as_node": ...}]}. Requires graph_id or '
-            "assistant_id in metadata."
+            '{"updates": [{"values": ..., "as_node": ...}]}. Requires graph_id in metadata.'
         ),
     )
 
@@ -125,7 +122,11 @@ class Thread(BaseModel):
 
     thread_id: str = Field(..., description="Unique identifier for the thread.")
     status: ThreadStatus = Field("idle", description="Current thread status: idle, busy, interrupted, or error.")
-    metadata: dict[str, Any] = Field(default_factory=dict, description="Arbitrary metadata attached to the thread.")
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices("metadata_dict", "metadata"),
+        description="Arbitrary metadata attached to the thread.",
+    )
     created_at: datetime = Field(..., description="Timestamp when the thread was created.")
     updated_at: datetime = Field(..., description="Timestamp when the thread was last updated.")
     state_updated_at: datetime | None = Field(None, description="Timestamp of the last state write.")
@@ -207,17 +208,12 @@ class ThreadCountRequest(BaseModel):
         return value.replace(tzinfo=UTC) if value is not None and value.tzinfo is None else value
 
 
-class ThreadSearchRequest(ThreadCountRequest):
+class ThreadSearchRequest(ThreadCountRequest, SearchPage[ThreadSelectField]):
     """Request model for thread search"""
 
-    limit: SearchLimit = 10
-    offset: SearchOffset = 0
-    sort_by: ThreadSortBy = Field("created_at", description="Field to sort by")
-    sort_order: SortOrder = Field("desc", description="Sort direction")
+    sort_by: ThreadSortBy = Field("created_at", description="Field to sort by.")
+
     ids: list[str] | None = Field(None, description="Restrict results to these thread IDs")
-    select: list[ThreadSelectField] | None = Field(
-        None, exclude=True, description="Fields to return; all fields when omitted"
-    )
     extract: dict[str, str] | None = Field(
         None,
         max_length=10,

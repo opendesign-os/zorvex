@@ -24,8 +24,6 @@ async def copy(source_thread_id: str, target_thread_id: str) -> None:
                 (table,),
             )
             columns = [row["column_name"] for row in await cur.fetchall()]
-            if not columns:
-                continue
             targets = sql.SQL(", ").join(sql.Identifier(c) for c in columns)
             projection = sql.SQL(", ").join(
                 sql.Placeholder() if c == "thread_id" else sql.Identifier(c) for c in columns

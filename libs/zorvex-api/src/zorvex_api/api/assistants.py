@@ -1,20 +1,10 @@
-"""Assistant endpoints for Agent Protocol
+"""Assistant endpoints; services/assistant_service.py does the work."""
 
-NOTE: This API follows a layered architecture pattern with business logic
-separated into a service layer (assistant_service.py). This was the first
-API to be refactored, and the plan is to gradually refactor all other APIs
-(runs, threads, etc.) to follow this same pattern for better code
-organization, testability, and maintainability.
-
-Architecture:
-- API Layer (this file): Thin FastAPI route handlers, request/response handling
-- Service Layer (assistant_service.py): Business logic, validation, orchestration
-"""
-
-from fastapi import APIRouter, Body, Depends, Query, Response
+from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import JSONResponse
 
-from zorvex_api.core.auth_deps import auth_dependency
+from zorvex_api.core import search
+from zorvex_api.core.auth import auth_dependency
 from zorvex_api.core.authorization import Authorization, Authorize
 from zorvex_api.models import (
     AgentSchemas,
@@ -24,9 +14,9 @@ from zorvex_api.models import (
     AssistantSearchRequest,
     AssistantUpdate,
 )
+from zorvex_api.models.assistants import AssistantVersionsRequest
 from zorvex_api.models.errors import CONFLICT, NOT_FOUND
 from zorvex_api.services.assistant_service import AssistantService, get_assistant_service
-from zorvex_api.utils.pagination import pagination_headers
 
 router = APIRouter(tags=["Assistants"], dependencies=auth_dependency)
 
@@ -55,23 +45,16 @@ async def create_assistant(
 @router.post("/assistants/search", response_model=list[Assistant], responses={**NOT_FOUND})
 async def search_assistants(
     request: AssistantSearchRequest,
-    response: Response,
     service: AssistantService = Depends(get_assistant_service),
     authorize: Authorization = Authorize("assistants", "search"),
-):
+) -> JSONResponse:
     """Search assistants with filters.
 
-    Filter by name, description, graph ID, or metadata. Results are paginated
-    via `limit` and `offset`.
+    Filter by name, graph ID, or metadata. Results are paginated via `limit`
+    and `offset`, and `select` picks the fields returned.
     """
-    results = await service.search_assistants(authorize, request.model_copy(update={"limit": request.limit + 1}))
-    headers = pagination_headers(len(results), limit=request.limit, offset=request.offset)
-    results = results[: request.limit]
-    if request.select:
-        chosen: set[str] = set(request.select)
-        return JSONResponse([a.model_dump(mode="json", include=chosen) for a in results], headers=headers)
-    response.headers.update(headers)
-    return results
+    items, headers = await service.search_assistants(authorize, request)
+    return search.respond(items, headers, request.select)
 
 
 @router.post("/assistants/count", response_model=int, responses={**NOT_FOUND})
@@ -168,15 +151,17 @@ async def set_assistant_latest(
 )
 async def list_assistant_versions(
     assistant_id: str,
+    request: AssistantVersionsRequest | None = None,
     service: AssistantService = Depends(get_assistant_service),
     authorize: Authorization = Authorize("assistants", "search"),
 ):
-    """List all versions of an assistant.
+    """List the versions of an assistant, newest first.
 
-    Returns versions ordered from newest to oldest. Each version captures the
-    assistant's configuration at the time of creation or update.
+    Each version captures the assistant's configuration at the time of its
+    creation or update. `limit` and `offset` page them, and `metadata` keeps
+    the versions whose metadata contains it.
     """
-    return await service.list_assistant_versions(authorize, assistant_id)
+    return await service.list_assistant_versions(authorize, assistant_id, request or AssistantVersionsRequest())
 
 
 @router.get(
@@ -201,8 +186,8 @@ async def get_assistant_schemas(
 @router.get("/assistants/{assistant_id}/graph", responses={**NOT_FOUND})
 async def get_assistant_graph(
     assistant_id: str,
-    xray: bool | int | None = Query(
-        None, description="Expand subgraph nodes. Pass true or a depth integer to control nesting."
+    xray: bool | int = Query(
+        False, description="Expand subgraph nodes. Pass true or a depth integer to control nesting."
     ),
     service: AssistantService = Depends(get_assistant_service),
     authorize: Authorization = Authorize("assistants", "read"),
@@ -213,8 +198,7 @@ async def get_assistant_graph(
     rendering in graph visualizers. Use `xray` to expand subgraph nodes into
     their internal structure.
     """
-    xray_value = xray if xray is not None else False
-    return await service.get_assistant_graph(authorize, assistant_id, xray_value)
+    return await service.get_assistant_graph(authorize, assistant_id, xray)
 
 
 @router.get("/assistants/{assistant_id}/subgraphs", responses={**NOT_FOUND})

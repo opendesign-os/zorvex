@@ -6,8 +6,6 @@ returns them to ``pending`` or marks their retry budget exhausted, then
 re-enqueues only retryable run IDs.
 """
 
-import asyncio
-import contextlib
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -18,12 +16,12 @@ from zorvex_api.core.orm import Run as RunORM
 from zorvex_api.core.orm import get_session_maker
 from zorvex_api.models.run_job import RunJob
 from zorvex_api.observability.metrics import REAPER_RECOVERED_RUNS
-from zorvex_api.services import job_queue
+from zorvex_api.services import job_queue, streaming_service
 from zorvex_api.services.broker import broker_manager
 from zorvex_api.services.executor import executor
+from zorvex_api.services.periodic import PeriodicTask
 from zorvex_api.services.run_queue import runnable
 from zorvex_api.services.run_status import settle_threads
-from zorvex_api.services.streaming_service import streaming_service
 from zorvex_api.services.webhook_delivery import RunOutcome, job_for_webhook, report_run
 from zorvex_api.settings import settings
 
@@ -32,42 +30,15 @@ logger = structlog.getLogger(__name__)
 _MAX_RETRIES_ERROR = {"error": "Error", "message": "Max retries exceeded after repeated worker failures"}
 
 
-class LeaseReaper:
-    """Recovers runs whose worker leases have expired."""
+class LeaseReaper(PeriodicTask):
+    """Recovers runs whose worker leases have expired, and pending runs the queue lost."""
 
-    def __init__(self) -> None:
-        self._task: asyncio.Task[None] | None = None
-        self._running = False
+    name = "lease reaper"
 
-    async def start(self) -> None:
-        self._running = True
-        self._task = asyncio.create_task(self._loop())
-        logger.info(
-            "Lease reaper started",
-            interval_seconds=settings.worker.REAPER_INTERVAL_SECONDS,
-        )
+    def interval(self) -> float:
+        return settings.worker.REAPER_INTERVAL_SECONDS
 
-    async def stop(self) -> None:
-        self._running = False
-        if self._task is not None:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
-        logger.info("Lease reaper stopped")
-
-    async def _loop(self) -> None:
-        interval = settings.worker.REAPER_INTERVAL_SECONDS
-        while self._running:
-            await asyncio.sleep(interval)
-            try:
-                await self._reap()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("Error in lease reaper")
-
-    async def _reap(self) -> None:
+    async def tick(self) -> None:
         """Find crashed workers and stuck pending runs, recover them."""
         crashed, stuck_pending = await self._find_recoverable()
 
@@ -272,7 +243,7 @@ class LeaseReaper:
 async def _end_failed_run(run_id: str) -> None:
     """End the stream of a run the reaper failed, and tell its waiters; best effort, as they also watch its status."""
     try:
-        await streaming_service.signal_run_error(run_id, _MAX_RETRIES_ERROR)
+        await streaming_service.end_run(run_id, "error", _MAX_RETRIES_ERROR)
         await broker_manager.publish_done(run_id)
     except RedisError:
         logger.warning("Could not end the stream of a failed run", run_id=run_id)

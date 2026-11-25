@@ -124,7 +124,7 @@ class ThreadEventSession:
         self._open_namespaces = {}
         self._interrupted = False
 
-        replayed = await broker.replay(None)
+        replayed = await broker.stored()
         if run_status in TERMINAL_RUN_STATUSES and not replayed:
             return
 

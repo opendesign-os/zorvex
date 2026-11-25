@@ -4,34 +4,30 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from typing import Annotated, Any, Literal
 
 import structlog
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from redis import RedisError
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import load_only
 from sse_starlette import EventSourceResponse, ServerSentEvent
 
 from zorvex_api.core import sse
-from zorvex_api.core.auth_deps import auth_dependency, require_auth
+from zorvex_api.core.auth import auth_dependency
 from zorvex_api.core.authorization import Authorization, Authorize
 from zorvex_api.core.orm import Run as RunORM
 from zorvex_api.core.orm import SessionDep
-from zorvex_api.models import Run, RunCreate, RunsCancel, User
+from zorvex_api.models import Run, RunCreate, RunsCancel
 from zorvex_api.models.enums import ACTIVE_RUN_STATUSES, TERMINAL_RUN_STATUSES, RunCancellationAction, RunStatus
 from zorvex_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
 from zorvex_api.models.runs import RUN_EXECUTION_PARAMS_FIELDS, RunSelectField, run_fields_from_execution_params
-from zorvex_api.services import checkpoints, run_waiters
+from zorvex_api.services import checkpoints, run_waiters, streaming_service
 from zorvex_api.services.ownership import on_visible_threads, owned_run, owned_thread
 from zorvex_api.services.run_cleanup import (
-    DISCONNECT_REASON,
-    cancel_run_by_id,
+    cancel_on_disconnect,
     request_run_interruption,
     stop_run_for_delete,
 )
 from zorvex_api.services.run_preparation import prepare_run
-from zorvex_api.services.streaming_service import streaming_service
 from zorvex_api.settings import settings
 
 CloseHandler = Callable[[MutableMapping[str, Any]], Awaitable[None]]
@@ -59,40 +55,37 @@ def _run_links(thread_id: str, run_id: str, attach: Literal["join", "stream"]) -
 
 def _cancel_on_disconnect_handler(run_id: str) -> CloseHandler:
     async def handler(_msg: MutableMapping[str, Any]) -> None:
-        try:
-            await cancel_run_by_id(run_id, action="interrupt", reason=DISCONNECT_REASON)
-        except (RedisError, OSError, SQLAlchemyError):
-            # Infra failures must not break sse-starlette teardown; the lease reaper
-            # picks up runs left unreachable. Programmer errors still propagate.
-            logger.exception("Failed to cancel run on client disconnect", run_id=run_id)
+        await cancel_on_disconnect(run_id)
 
     return handler
 
 
-def stream_response(run: Run, *, cancel_on_disconnect: bool) -> EventSourceResponse:
-    """The SSE stream of a run this request created."""
+def stream_response(
+    run: Run,
+    *,
+    cancel_on_disconnect: bool,
+    last_event_id: str | None = None,
+    stream_mode: list[str] | None = None,
+) -> EventSourceResponse:
+    """The run's SSE stream after *last_event_id*, in *stream_mode*; a client that leaves cancels it on request.
+
+    Only on request: other clients may follow the same run through join or stream.
+    """
     return sse.response(
-        streaming_service.stream_run_execution(run),
+        streaming_service.stream_run(run, last_event_id, stream_mode),
         close_handler=_cancel_on_disconnect_handler(run.run_id) if cancel_on_disconnect else None,
         headers=_run_links(run.thread_id, run.run_id, "stream"),
     )
 
 
-def wait_body(run: Run, user: User, http: Request, on_disconnect: str) -> AsyncGenerator[bytes]:
-    """Heartbeat newlines until *run* finishes, then its result; with ``on_disconnect="cancel"`` a client
-    that leaves cancels the run."""
-    leaves = http.is_disconnected if on_disconnect == "cancel" else None
-    return run_waiters.wait_body(run.run_id, run.thread_id, user, is_disconnected=leaves)
+def wait_response(thread_id: str, run_id: str, body: AsyncIterator[bytes]) -> StreamingResponse:
+    """The wait for a run as chunked JSON: *body*, ``run_waiters.wait_body``'s heartbeats then the result."""
+    return StreamingResponse(body, media_type="application/json", headers=_run_links(thread_id, run_id, "join"))
 
 
 def run_location(run: Run) -> dict[str, str]:
     """The Content-Location of a run just created, as the Agent Server sends it."""
     return {"Content-Location": f"/threads/{run.thread_id}/runs/{run.run_id}"}
-
-
-def wait_response(run: Run, body: AsyncIterator[bytes]) -> StreamingResponse:
-    """A chunked JSON response carrying *body*, the wait for *run*."""
-    return StreamingResponse(body, media_type="application/json", headers=_run_links(run.thread_id, run.run_id, "join"))
 
 
 @router.post("/threads/{thread_id}/runs", response_model=Run, responses={**NOT_FOUND, **CONFLICT})
@@ -101,7 +94,6 @@ async def create_run(
     request: RunCreate,
     session: SessionDep,
     response: Response,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "create_run"),
 ) -> Run:
     """Create and execute a new run.
@@ -111,6 +103,7 @@ async def create_run(
     endpoint to follow progress. Provide either `input` or `command` (for
     human-in-the-loop resumption) but not both.
     """
+    user = authorize.user
     run = await prepare_run(session, thread_id, request, user, authorize=authorize)
     response.headers.update(run_location(run))
     return run
@@ -121,7 +114,6 @@ async def create_and_stream_run(
     thread_id: str,
     request: RunCreate,
     session: SessionDep,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "create_run"),
 ) -> EventSourceResponse:
     """Create a new run and stream its execution via SSE.
@@ -137,6 +129,7 @@ async def create_and_stream_run(
     ``KEEPALIVE_INTERVAL_SECS`` so idle proxies don't drop long-running
     silent nodes (e.g. agents holding an upstream WebSocket).
     """
+    user = authorize.user
     run = await prepare_run(session, thread_id, request, user, authorize=authorize)
     return stream_response(run, cancel_on_disconnect=request.on_disconnect == "cancel")
 
@@ -146,7 +139,6 @@ async def get_run(
     thread_id: str,
     run_id: str,
     session: SessionDep,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "read"),
 ) -> Run:
     """Get a run by its ID.
@@ -154,6 +146,7 @@ async def get_run(
     Returns the current state of the run including its status, input, output,
     and error information.
     """
+    user = authorize.user
     # Reading a run authorizes as a thread read (Agent Protocol has no `runs`
     # resource); @auth.on.threads.read covers it.
     filters = await authorize({"thread_id": thread_id, "run_id": run_id})
@@ -175,7 +168,6 @@ async def list_runs(
             "Leave out `output` to skip loading each run's final state.",
         ),
     ] = None,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "search"),
 ) -> list[Run] | JSONResponse:
     """List runs for a thread.
@@ -183,6 +175,7 @@ async def list_runs(
     Returns runs ordered by creation time (newest first). Use `status` to
     filter, `limit`/`offset` to paginate and `select` to return only some fields.
     """
+    user = authorize.user
     filters = await authorize({"thread_id": thread_id, "status": status, "limit": limit, "offset": offset})
     stmt = (
         select(RunORM)
@@ -226,7 +219,6 @@ async def join_run(
     request: Request,
     session: SessionDep,
     cancel_on_disconnect: bool = Query(False, description="Cancel the run when this client disconnects."),
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "read"),
 ) -> Response:
     """Wait for a run to complete and return its result.
@@ -243,19 +235,15 @@ async def join_run(
     ``langgraph_sdk``'s ``runs.join`` hands that body back as-is, unlike
     ``runs.wait``, which inspects the key and raises.
     """
+    user = authorize.user
     filters = await authorize({"thread_id": thread_id, "run_id": run_id})
     run = await owned_run(session, thread_id, run_id, user, filters=filters)
     if run.status in TERMINAL_RUN_STATUSES:
         result = await run_waiters.run_result(run_id, thread_id, user)
         return Response(run_waiters.encode_result(result), media_type="application/json")
 
-    body = run_waiters.wait_body(
-        run_id,
-        thread_id,
-        user,
-        is_disconnected=request.is_disconnected if cancel_on_disconnect else None,
-    )
-    return StreamingResponse(body, media_type="application/json", headers=_run_links(thread_id, run_id, "join"))
+    leaves = request.is_disconnected if cancel_on_disconnect else None
+    return wait_response(thread_id, run_id, run_waiters.wait_body(run_id, thread_id, user, is_disconnected=leaves))
 
 
 @router.post("/threads/{thread_id}/runs/wait", responses={**NOT_FOUND, **CONFLICT})
@@ -264,7 +252,6 @@ async def wait_for_run(
     request: RunCreate,
     session: SessionDep,
     http: Request,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "create_run"),
 ) -> StreamingResponse:
     """Create a run, execute it, and wait for completion.
@@ -279,8 +266,11 @@ async def wait_for_run(
     gave up on returns ``{"__error__": {"error": ..., "message": ...}}``; the
     LangGraph SDK reads that key and raises.
     """
+    user = authorize.user
     run = await prepare_run(session, thread_id, request, user, authorize=authorize)
-    return wait_response(run, wait_body(run, user, http, request.on_disconnect))
+    leaves = http.is_disconnected if request.on_disconnect == "cancel" else None
+    body = run_waiters.wait_body(run.run_id, run.thread_id, user, is_disconnected=leaves)
+    return wait_response(run.thread_id, run.run_id, body)
 
 
 @router.get("/threads/{thread_id}/runs/{run_id}/stream", responses={**SSE_RESPONSE, **NOT_FOUND})
@@ -293,7 +283,6 @@ async def stream_run(
         None, description="Narrow this connection to a subset of the modes the run was created with."
     ),
     cancel_on_disconnect: bool = Query(False, description="Cancel the run when this client disconnects."),
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "read"),
 ) -> EventSourceResponse:
     """Stream an existing run's execution via SSE.
@@ -306,6 +295,7 @@ async def stream_run(
     A periodic SSE keepalive comment is sent every
     ``KEEPALIVE_INTERVAL_SECS`` so idle proxies don't drop attached streams.
     """
+    user = authorize.user
     filters = await authorize({"thread_id": thread_id, "run_id": run_id})
     run = Run.model_validate(await owned_run(session, thread_id, run_id, user, filters=filters))
     headers = _run_links(thread_id, run_id, "stream")
@@ -319,11 +309,8 @@ async def stream_run(
 
         return sse.response(end_only(), headers=headers)
 
-    # Only on request: other clients may be attached to the same run via /join or /stream.
-    return sse.response(
-        streaming_service.stream_run_execution(run, last_event_id, stream_mode),
-        headers=headers,
-        close_handler=_cancel_on_disconnect_handler(run_id) if cancel_on_disconnect else None,
+    return stream_response(
+        run, cancel_on_disconnect=cancel_on_disconnect, last_event_id=last_event_id, stream_mode=stream_mode
     )
 
 
@@ -342,7 +329,6 @@ async def cancel_run_endpoint(
     session: SessionDep,
     wait: bool = Query(False, description="Answer once the run has stopped, with its result, as join does."),
     action: RunCancellationAction = Query(_CANCEL_ACTION_DEFAULT, description=_CANCEL_ACTION_DOC),
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "update"),
 ) -> Response:
     """Cancel a pending or running run: interrupt it, or roll it back.
@@ -353,6 +339,7 @@ async def cancel_run_endpoint(
     or a rolled-back run's `UserRollback`, the message saying why. A run that
     already finished is not found (404).
     """
+    user = authorize.user
     filters = await authorize({"thread_id": thread_id, "run_id": run_id, "action": action})
     run = await owned_run(session, thread_id, run_id, user, filters=filters)
     if run.status in TERMINAL_RUN_STATUSES:
@@ -364,8 +351,7 @@ async def cancel_run_endpoint(
         return Response(status_code=202)
     # Hold no pool connection while the run stops.
     await session.commit()
-    body = run_waiters.wait_body(run_id, thread_id, user)
-    return StreamingResponse(body, media_type="application/json", headers=_run_links(thread_id, run_id, "join"))
+    return wait_response(thread_id, run_id, run_waiters.wait_body(run_id, thread_id, user))
 
 
 @router.post("/runs/cancel", status_code=204, responses={**NOT_FOUND})
@@ -373,7 +359,6 @@ async def cancel_runs(
     request: RunsCancel,
     session: SessionDep,
     action: RunCancellationAction = Query(_CANCEL_ACTION_DEFAULT, description=_CANCEL_ACTION_DOC),
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "update"),
 ) -> None:
     """Cancel several runs at once, by status or by thread_id plus run_ids: interrupt them, or roll them back.
@@ -382,6 +367,7 @@ async def cancel_runs(
     are skipped. When no run is selected, or none of those selected is still
     pending or running, the answer is 404.
     """
+    user = authorize.user
     filters = await authorize({**request.model_dump(), "action": action})
     stmt = select(RunORM).where(RunORM.user_id == user.identity)
     if request.thread_id is not None:
@@ -407,10 +393,10 @@ async def delete_run(
     thread_id: str,
     run_id: str,
     session: SessionDep,
-    user: User = Depends(require_auth),
     authorize: Authorization = Authorize("threads", "delete"),
 ) -> None:
     """Delete a run and the checkpoints it wrote; an active run is stopped first."""
+    user = authorize.user
     # Deleting a run authorizes as a thread delete (Agent Protocol has no `runs`
     # resource); @auth.on.threads.delete covers it.
     filters = await authorize({"thread_id": thread_id, "run_id": run_id})

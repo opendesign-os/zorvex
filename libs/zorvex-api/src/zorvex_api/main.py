@@ -37,8 +37,7 @@ from zorvex_api.api.ui import router as ui_router
 from zorvex_api.api.ui import ui_dir
 from zorvex_api.config import CorsConfig, HttpConfig, load_config, mount_prefix
 from zorvex_api.core import loopback
-from zorvex_api.core.auth_deps import require_auth
-from zorvex_api.core.auth_middleware import get_auth_backend
+from zorvex_api.core.auth import get_auth_backend, require_auth
 from zorvex_api.core.authorization import check_authorization
 from zorvex_api.core.database import db_manager
 from zorvex_api.core.migrations import run_migrations_async
@@ -100,8 +99,7 @@ def _log_connection_help(error: Exception) -> None:
         "Troubleshooting tips:\n"
         "  - Local development?  Run 'zorvex dev' (starts PostgreSQL automatically)\n"
         "  - Docker deployment?  Run 'zorvex up' (starts PostgreSQL + app)\n"
-        "  - External database?  Check DATABASE_URI in your .env\n"
-        "  - Missing .env file?  Copy .env.example to .env and configure it"
+        "  - External database?  Check DATABASE_URI in your .env"
     )
 
 
@@ -266,15 +264,14 @@ def _apply_auth_to_custom_routes(app: FastAPI, auth_deps: list[Any]) -> int:
                 else:
                     protected += int(context_changed)
                 continue
-            # FastAPI wraps included routers; newer versions expose the wrapped
-            # router as `original_router` rather than `routes`.
+            # FastAPI keeps an included router whole, as the wrapper's `original_router`.
             nested = getattr(route, "original_router", None)
             if nested is not None:
                 changed = _prepend_to_include_context(route, auth_deps) if context_changed is None else context_changed
                 walk(list(nested.routes), changed)
                 # Effective routes are cached until the wrapped router reports a change; a
                 # schema built at import would otherwise keep serving them unauthenticated.
-                getattr(nested, "_mark_routes_changed", lambda: None)()
+                nested._mark_routes_changed()
             elif getattr(route, "routes", None):
                 # A mounted app's routes never inherit an include context.
                 walk(list(route.routes), None)
@@ -468,7 +465,7 @@ def create_app() -> FastAPI | Starlette:
     else:
         application = FastAPI(
             title=config.name,
-            description="Production-ready Agent Protocol server",
+            description="The LangGraph Agent Server API, self-hosted",
             version=__version__,
             docs_url=None if http.disable_meta else "/docs",
             redoc_url=None,

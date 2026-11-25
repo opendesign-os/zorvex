@@ -18,11 +18,11 @@ from zorvex_api.core.orm import Thread as ThreadORM
 from zorvex_api.core.orm import get_session_maker
 from zorvex_api.models import Run
 from zorvex_api.models.enums import ACTIVE_RUN_STATUSES, TERMINAL_RUN_STATUSES, RunCancellationAction
+from zorvex_api.services import streaming_service
 from zorvex_api.services.base_broker import cancelled_error
 from zorvex_api.services.executor import executor
 from zorvex_api.services.run_cancel import rollback_run
 from zorvex_api.services.run_status import Ending, finalize_run, interrupt_unowned_run, unowned
-from zorvex_api.services.streaming_service import streaming_service
 from zorvex_api.services.webhook_delivery import job_for_run
 from zorvex_api.settings import settings
 
@@ -35,16 +35,16 @@ _background_tasks: set[asyncio.Task[None]] = set()
 _CLEANUP_ERRORS: tuple[type[BaseException], ...] = (RedisError, SQLAlchemyError, OSError, PsycopgError)
 
 
-# Why the Agent Server cancels a run, when the run's own cancel route did not.
-DISCONNECT_REASON = "client disconnected from the run stream (on_disconnect=cancel)"
+# Why a run whose client left is cancelled, as the Agent Server words it.
+_DISCONNECT_REASON = "client disconnected from the run stream (on_disconnect=cancel)"
 
 
 async def request_run_interruption(
     session: AsyncSession,
     run_orm: RunORM,
     *,
-    action: RunCancellationAction = "interrupt",
-    reason: str | None = None,
+    action: RunCancellationAction,
+    reason: str,
 ) -> None:
     """Cancel an active run, as the Agent Server cancels: interrupt it, or roll it back.
 
@@ -64,7 +64,7 @@ async def request_run_interruption(
     kept_action, kept_reason = recorded
     error = cancelled_error(kept_action, kept_reason)
     if run_orm.run_id in executing_runs:
-        await streaming_service.cancel_run(run_orm.run_id, error=error)
+        await streaming_service.cancel_run(run_orm.run_id, end_error=error)
         return
 
     if kept_action == "rollback":
@@ -88,9 +88,9 @@ async def request_run_interruption(
     if ended:
         # A delayed worker can outlive an expired lease, and a local run may still wait
         # its turn: ask either to stop. The streams close here, as no executor owns the run.
-        await streaming_service.cancel_run(run_orm.run_id, emit_end_event=False)
+        await streaming_service.cancel_run(run_orm.run_id, end_error=None)
         try:
-            await streaming_service.signal_run_cancelled(run_orm.run_id, error)
+            await streaming_service.end_run(run_orm.run_id, "interrupted", error)
         except (RedisError, OSError):
             # The database has already committed. A broker outage must not turn
             # the successful cancel into an API error.
@@ -102,15 +102,22 @@ async def request_run_interruption(
     if run_orm.status in TERMINAL_RUN_STATUSES:
         return
 
-    await streaming_service.cancel_run(run_orm.run_id, error=error)
+    await streaming_service.cancel_run(run_orm.run_id, end_error=error)
 
 
-async def cancel_run_by_id(run_id: str, *, action: RunCancellationAction, reason: str) -> None:
-    """``request_run_interruption`` for a run named by id, in a session of its own; a missing run is left alone."""
-    async with get_session_maker()() as session:
-        run_orm = await session.get(RunORM, run_id)
-        if run_orm is not None:
-            await request_run_interruption(session, run_orm, action=action, reason=reason)
+async def cancel_on_disconnect(run_id: str) -> None:
+    """Interrupt the run its client left, as ``on_disconnect="cancel"`` asks; a missing run is left alone.
+
+    Best effort: an infrastructure failure is logged, as a stream's teardown or a wait's
+    end must not fail on it, and the run's worker or the lease reaper settles the run.
+    """
+    try:
+        async with get_session_maker()() as session:
+            run_orm = await session.get(RunORM, run_id)
+            if run_orm is not None:
+                await request_run_interruption(session, run_orm, action="interrupt", reason=_DISCONNECT_REASON)
+    except _CLEANUP_ERRORS:
+        logger.exception("Failed to cancel run on client disconnect", run_id=run_id)
 
 
 async def _record_cancel(
@@ -147,7 +154,7 @@ async def stop_run_for_delete(run: RunORM) -> None:
     await finalize_run(
         run.run_id, run.thread_id, Ending("interrupted", "idle"), user_id=run.user_id, webhook_job=job_for_run(run)
     )
-    await streaming_service.cancel_run(run.run_id)
+    await streaming_service.cancel_run(run.run_id, end_error=cancelled_error())
     task = active_runs.get(run.run_id)
     if task is not None and not task.done():
         task.cancel()

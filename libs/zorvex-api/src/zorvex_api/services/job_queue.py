@@ -38,5 +38,9 @@ async def queued(run_ids: Sequence[str]) -> set[str]:
     """The runs among *run_ids* the queue holds. Raises RedisError."""
     if not run_ids:
         return set()
-    scores = await redis_manager.get_client().zmscore(settings.redis.queue_key, list(run_ids))
-    return {run_id for run_id, found in zip(run_ids, scores, strict=True) if found is not None}
+    # One round trip, in a command every Redis has (ZMSCORE needs 6.2).
+    pipe = redis_manager.get_client().pipeline(transaction=False)
+    for run_id in run_ids:
+        pipe.zscore(settings.redis.queue_key, run_id)
+    scores = await pipe.execute()
+    return {run_id for run_id, score in zip(run_ids, scores, strict=True) if score is not None}

@@ -4,16 +4,14 @@ Revision ID: 0001
 Revises:
 Create Date: 2026-11-25
 
-Zorvex's own tables, as core/orm.py defines them. LangGraph creates and migrates
-its checkpoint and store tables itself. A database from before this baseline has
-no upgrade path: recreate it. One at 0002 (run priority, folded in here) already
-has this schema: stamp it instead, ``alembic stamp --purge 0001``.
+Zorvex's own tables, as core/orm.py defines them; LangGraph creates and migrates
+its checkpoint and store tables itself. A database from an earlier schema has no
+upgrade path: recreate it.
 """
 
 import sqlalchemy as sa
-from sqlalchemy.dialects import postgresql
-
 from alembic import op
+from sqlalchemy.dialects import postgresql
 
 revision = "0001"
 down_revision = None
@@ -29,7 +27,6 @@ def upgrade() -> None:
         sa.Column("description", sa.Text(), nullable=True),
         sa.Column("graph_id", sa.Text(), nullable=False),
         sa.Column("config", postgresql.JSONB(), server_default=sa.text("'{}'::jsonb"), nullable=False),
-        sa.Column("context", postgresql.JSONB(), server_default=sa.text("'{}'::jsonb"), nullable=False),
         sa.Column("user_id", sa.Text(), nullable=False),
         sa.Column("version", sa.Integer(), server_default=sa.text("1"), nullable=False),
         sa.Column("metadata", postgresql.JSONB(), server_default=sa.text("'{}'::jsonb"), nullable=False),
@@ -77,7 +74,6 @@ def upgrade() -> None:
         sa.Column("version", sa.Integer(), nullable=False),
         sa.Column("graph_id", sa.Text(), nullable=False),
         sa.Column("config", postgresql.JSONB(), server_default=sa.text("'{}'::jsonb"), nullable=False),
-        sa.Column("context", postgresql.JSONB(), server_default=sa.text("'{}'::jsonb"), nullable=False),
         sa.Column("created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.Column("metadata", postgresql.JSONB(), server_default=sa.text("'{}'::jsonb"), nullable=False),
         sa.Column("name", sa.Text(), nullable=False),
@@ -132,10 +128,8 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("run_id"),
     )
     op.create_index("idx_run_assistant_id", "run", ["assistant_id"], unique=False)
-    op.create_index("idx_run_created_at", "run", ["created_at"], unique=False)
-    op.create_index("idx_run_lease_reaper", "run", ["status", "lease_expires_at"], unique=False)
-    op.create_index("idx_run_thread_id", "run", ["thread_id"], unique=False)
-    op.create_index("idx_run_user", "run", ["user_id"], unique=False)
+    op.create_index("idx_run_status_lease", "run", ["status", "lease_expires_at"], unique=False)
+    op.create_index("idx_run_thread_created", "run", ["thread_id", "created_at"], unique=False)
     op.create_table(
         "thread_ttl",
         sa.Column("thread_id", sa.Text(), nullable=False),

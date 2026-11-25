@@ -3,11 +3,11 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, computed_field
 
 from zorvex_api.models.entity_ids import ENTITY_ID_PATTERN, MAX_ENTITY_ID_LENGTH
-from zorvex_api.models.enums import AssistantSortBy, OnConflictBehavior, SortOrder
-from zorvex_api.models.search import SearchLimit, SearchOffset
+from zorvex_api.models.enums import AssistantSortBy, OnConflictBehavior
+from zorvex_api.models.search import SearchLimit, SearchOffset, SearchPage
 
 
 class AssistantCreate(BaseModel):
@@ -31,7 +31,9 @@ class AssistantCreate(BaseModel):
     )
     description: str | None = Field(None, description="Assistant description")
     config: dict[str, Any] | None = Field(default_factory=dict, description="Assistant configuration")
-    context: dict[str, Any] | None = Field(default_factory=dict, description="Assistant context")
+    context: dict[str, Any] | None = Field(
+        default_factory=dict, description="Assistant context; the same as config.configurable, which it replaces."
+    )
     graph_id: str = Field(..., description="LangGraph graph ID from zorvex.json")
     metadata: dict[str, Any] | None = Field(
         default_factory=dict, description="Metadata to use for searching and filtering assistants."
@@ -42,15 +44,14 @@ class AssistantCreate(BaseModel):
 
 
 class Assistant(BaseModel):
-    """Assistant entity model"""
+    """Assistant entity model; an assistant version has the same shape."""
+
+    model_config = ConfigDict(from_attributes=True)
 
     assistant_id: str = Field(..., description="Unique identifier for the assistant.")
     name: str = Field(..., description="Human-readable name of the assistant.")
     description: str | None = Field(None, description="Optional description of the assistant's purpose.")
     config: dict[str, Any] = Field(default_factory=dict, description="Configuration passed to the graph at runtime.")
-    context: dict[str, Any] = Field(
-        default_factory=dict, description="Context variables available to the graph during execution."
-    )
     graph_id: str = Field(..., description="Identifier of the graph this assistant executes.")
     version: int = Field(..., description="The version of the assistant.")
     metadata: dict[str, Any] = Field(
@@ -62,49 +63,35 @@ class Assistant(BaseModel):
     created_at: datetime = Field(..., description="Timestamp when the assistant was created.")
     updated_at: datetime = Field(..., description="Timestamp when the assistant was last updated.")
 
-    model_config = ConfigDict(from_attributes=True)
-
-
-def _publish_the_not_null_columns(schema: dict[str, Any]) -> None:
-    """Publish ``name`` and ``graph_id`` as the endpoint takes them: never null.
-
-    Both back NOT NULL columns and are answered 422 when supplied empty. They
-    stay nullable on the model so a null arrives as supplied and gets that
-    answer rather than a generic type error.
-    """
-    for field in ("name", "graph_id"):
-        published = schema["properties"][field]
-        published.pop("anyOf", None)
-        published.pop("default", None)
-        published["type"] = "string"
+    @computed_field(description="Context variables available to the graph during execution: config.configurable.")
+    @property
+    def context(self) -> dict[str, Any]:
+        return self.config.get("configurable") or {}
 
 
 class AssistantUpdate(BaseModel):
     """Request model for partially updating assistants.
 
-    Every field is optional and defaults to ``None`` so that an omitted field
-    is distinguishable from an explicit one via ``model_dump(exclude_unset=True)``:
-    omitting ``config`` keeps the stored config, sending ``{"config": {}}`` clears it.
-
-    A null clears ``description`` and reads as empty for the other dict fields.
-    ``name`` and ``graph_id`` back NOT NULL columns and refuse one.
+    An omitted field keeps its stored value (read with ``exclude_unset``), so
+    ``{"config": {}}`` clears the config. A null clears ``description``, reads
+    as empty for the dict fields, and leaves ``name`` and ``graph_id`` as they are.
     """
 
-    name: str | None = Field(None, description="The name of the assistant. Unchanged when omitted.")
+    name: str | None = Field(
+        None, min_length=1, description="The name of the assistant. Unchanged when omitted or null."
+    )
     description: str | None = Field(None, description="The description of the assistant. Unchanged when omitted.")
     config: dict[str, Any] | None = Field(
         None, description="Configuration to use for the graph. Unchanged when omitted."
     )
-    graph_id: str | None = Field(None, description="The ID of the graph. Unchanged when omitted.")
+    graph_id: str | None = Field(None, min_length=1, description="The ID of the graph. Unchanged when omitted or null.")
     context: dict[str, Any] | None = Field(
         None,
-        description="The context to use for the graph. Useful when graph is configurable. Unchanged when omitted.",
+        description="The context to use for the graph: config.configurable, which it replaces. Unchanged when omitted.",
     )
     metadata: dict[str, Any] | None = Field(
         None, description="Metadata to merge into the assistant's existing metadata."
     )
-
-    model_config = ConfigDict(json_schema_extra=_publish_the_not_null_columns)
 
 
 AssistantSelectField = Literal[
@@ -129,14 +116,18 @@ class AssistantCountRequest(BaseModel):
     metadata: dict[str, Any] | None = Field(None, description="Assistants whose metadata contains these pairs.")
 
 
-class AssistantSearchRequest(AssistantCountRequest):
+class AssistantSearchRequest(AssistantCountRequest, SearchPage[AssistantSelectField]):
     """Request model for assistant search"""
+
+    sort_by: AssistantSortBy = Field("created_at", description="Field to sort by.")
+
+
+class AssistantVersionsRequest(BaseModel):
+    """Request body of POST /assistants/{assistant_id}/versions: a page of versions, newest first."""
 
     limit: SearchLimit = 10
     offset: SearchOffset = 0
-    sort_by: AssistantSortBy = Field("created_at", description="Field to sort by.")
-    sort_order: SortOrder = Field("desc", description="Sort direction.")
-    select: list[AssistantSelectField] | None = Field(None, description="Fields to return; all fields when omitted")
+    metadata: dict[str, Any] | None = Field(None, description="Versions whose metadata contains these pairs.")
 
 
 class AgentSchemas(BaseModel):
