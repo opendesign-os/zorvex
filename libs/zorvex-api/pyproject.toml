@@ -1,6 +1,6 @@
 [project]
 name = "zorvex-api"
-version = "0.0.4"
+version = "0.0.5"
 description = "The Zorvex server: the LangGraph Agent Server API, self-hosted on PostgreSQL"
 readme = "README.md"
 requires-python = ">=3.12"
